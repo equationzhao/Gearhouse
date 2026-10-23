@@ -1,0 +1,3 @@
+// Copy this file to Local.xcconfig and fill in your Apple development team.
+DEVELOPMENT_TEAM = YOUR_TEAM_ID
+GEARHOUSE_BUNDLE_IDENTIFIER = com.yourname.Gearhouse

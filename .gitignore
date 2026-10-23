@@ -1,0 +1,37 @@
+# Build output and IDE state
+.build/
+.swiftpm/
+DerivedData/
+build/
+*.xcresult/
+xcuserdata/
+*.xcuserstate
+.DS_Store
+__pycache__/
+*.pyc
+
+# Personal signing and credentials
+/Config/Local.xcconfig
+.env
+.env.*
+!.env.example
+*.p12
+*.p8
+*.pem
+*.key
+*.mobileprovision
+
+# Local data, backups, diagnostics and development artifacts
+/exports/
+/verification/
+/design/
+/BUILD_STATUS.md
+/keychain-self-test.json
+/gearhouse-mvp-simulator.png
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.gearhousebackup
+*.log
+*.ipa
+*.dSYM/

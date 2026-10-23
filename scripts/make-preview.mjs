@@ -1,0 +1,11 @@
+import {writeFileSync} from 'node:fs';
+import {empty,saveGear,batchMove,mergeActivities} from '../SharedRules/lib/domain.mjs';
+const s=empty();
+s.remoteGears=[{id:'demo-tarmac',name:'Tarmac',type:'Bike'},{id:'demo-propel',name:'Propel',type:'Bike'}];
+const gear=(name,type,id,remoteId)=>{const g=saveGear(s,{name,type,remoteId});g.id=id;return g;};
+gear('Tarmac SL8 Pro','Bike','tarmac','demo-tarmac');gear('Propel Advanced','Bike','propel','demo-propel');gear('CL II','Wheelset','clii');gear('IRC Front','Tyre','front');gear('IRC Rear','Tyre','rear');gear('KMC Chain','Chain','chain');gear('RC7','CyclingShoes','shoes');gear('SPD-SL 黄锁片','Cleats','cleats');gear('功率锁踏','Pedals','pedals');
+batchMove(s,[{gearId:'clii',parentId:'tarmac'},{gearId:'front',parentId:'clii'},{gearId:'rear',parentId:'clii'},{gearId:'chain',parentId:'tarmac'},{gearId:'pedals',parentId:'tarmac'},{gearId:'cleats',parentId:'shoes'}],'2024-10-28T16:30:00');
+batchMove(s,[{gearId:'clii',parentId:null}],'2026-02-07T16:30:00');batchMove(s,[{gearId:'clii',parentId:'propel'}],'2026-09-28T20:59:00');
+mergeActivities(s,[{id:'demo-ride',name:'周末公路骑行',type:'Ride',start_date_local:'2026-10-12T07:30:00',distance:82400,moving_time:10420,gear:{id:'demo-propel'}},{id:'demo-ride2',name:'清晨骑行',type:'Ride',start_date_local:'2025-11-02T08:15:00',distance:45200,moving_time:6200,gear:{id:'demo-tarmac'}},{id:'demo-virtual',name:'室内训练',type:'VirtualRide',start_date_local:'2026-10-14T18:00:00',distance:28600,moving_time:3600,gear:{id:'demo-propel'}}]);
+s.gearEvents=[{id:'wax-event',gearId:'chain',kind:'hotWax',occurredDate:'2026-10-10',occurredTime:null,notes:'清洁后重新煮蜡',createdAt:'2026-10-10T09:00:00Z'}];s.gearImportVersion=3;s.gearImported=true;s.syncLog=[{oldest:'2024-01-01',newest:'2026-10-16',added:3,updated:0}];
+writeFileSync(new URL('../Sources/GearhouseCore/Resources/preview-fixture.json',import.meta.url),JSON.stringify(s));

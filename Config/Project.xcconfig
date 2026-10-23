@@ -1,0 +1,4 @@
+// Shared defaults. Personal signing belongs in Local.xcconfig.
+GEARHOUSE_BUNDLE_IDENTIFIER = org.gearhouse.Gearhouse
+IPHONEOS_DEPLOYMENT_TARGET = 17.0
+#include? "Local.xcconfig"
