@@ -93,6 +93,34 @@ final class GearInventoryTests: XCTestCase {
         XCTAssertEqual(index.parents["tyre"], "spare-wheel")
         XCTAssertEqual(s.status("wheel"), "stock"); XCTAssertEqual(s.status("tyre"), "active")
     }
+    func testEditingReplacementPreservesTransferredChildrenAndSavedActivities() throws {
+        for date in ["2024-07-01", "2024-07-02"] {
+            let session = try Session()
+            let operation = try session.run("inventory-save", ["kind":"replace", "gearId":"wheel", "replacementId":"spare-wheel", "childIds":["tyre"], "at":"2024-07-01"])
+            let savedActivities = session.state["activities"]
+            let options = try session.run("inventory-options", ["gearId":"wheel", "operationId":operation["id"], "at":.string(date)])
+            XCTAssertEqual(options["parentId"], "bike")
+            XCTAssertTrue(options["children"].array.contains { $0.id == "tyre" })
+            XCTAssertTrue(options["candidates"].array.contains { $0.id == "spare-wheel" })
+            let childIDs = operation["childIds"].array.filter { child in options["children"].array.contains { $0["id"] == child } }
+            XCTAssertEqual(childIDs, ["tyre"])
+            var edit: Value = ["kind":"replace", "gearId":"wheel", "replacementId":operation["replacementId"], "operationId":operation["id"],
+                               "childIds":.array(childIDs), "destination":operation["destination"], "at":.string(date)]
+            let preview = try session.run("inventory-preview", edit)
+            XCTAssertEqual(preview["transferred"].array.map(\.id), ["tyre"])
+            edit["revision"] = preview["revision"]
+            let saved = try session.run("inventory-save", edit)
+            XCTAssertEqual(saved["childIds"], ["tyre"])
+            XCTAssertEqual(saved["id"], operation["id"])
+            XCTAssertEqual(session.state["gearOperations"].array.count, 1)
+            let index = GearTreeIndex(gears: session.state["gears"].array, events: session.state["events"].array, at: "2024-07-03T00:00:00")
+            XCTAssertEqual(index.parents["tyre"], "spare-wheel")
+            XCTAssertEqual(index.parents["spare-wheel"], "bike")
+            XCTAssertEqual(session.status("wheel"), "stock")
+            XCTAssertEqual(session.status("tyre"), "active")
+            XCTAssertEqual(session.state["activities"], savedActivities)
+        }
+    }
     func testHistoricalImportAndRemoteConflictUseActivityDate() throws {
         let s = try Session()
         try s.run("inventory-save", ["kind":"store", "gearId":"wheel", "at":"2024-06-10"])
@@ -171,6 +199,39 @@ final class GearInventoryTests: XCTestCase {
         try s.run("inventory-save", ["kind":"activate", "gearId":"old", "at":"2024-07-03"])
         XCTAssertEqual(s.status("old"), "active")
         XCTAssertTrue(GearReminderEngine.evaluate(reminder, state:s.state, total:2430000, now:now).due)
+    }
+    func testSavingChildMetadataDoesNotPersistInheritedRetirement() throws {
+        let session = try Session(), latest = "9999-12-31T23:59:59"
+        var parent = session.state["gears"].array.first { $0.id == "bike" }!
+        parent["retired"] = true
+        try session.run("gear", parent)
+        XCTAssertEqual(session.status("old", latest), "retired")
+        XCTAssertEqual(GearInventory.readOwnStatus(state: session.state, gearID: "old", at: latest), "active")
+        let originalChildStates = session.state["gearStates"].array.filter { $0["gearId"] == "old" }
+        var child = session.state["gears"].array.first { $0.id == "old" }!
+        child["notes"] = "Cleaned the drivetrain"
+        child["retired"] = .bool(GearInventory.readOwnStatus(state: session.state, gearID: "old", at: latest) == "retired")
+        try session.run("gear", child)
+        XCTAssertEqual(session.state["gearStates"].array.filter { $0["gearId"] == "old" }, originalChildStates)
+        XCTAssertEqual(session.state["gears"].array.first { $0.id == "old" }?["notes"], "Cleaned the drivetrain")
+        parent = session.state["gears"].array.first { $0.id == "bike" }!
+        parent["retired"] = false
+        try session.run("gear", parent)
+        XCTAssertEqual(session.status("bike", latest), "active")
+        XCTAssertEqual(session.status("old", latest), "active")
+    }
+    func testOwnStatusHonorsLegacyRetirementAndDatedStatesWithoutInheritingParent() {
+        let state: Value = [
+            "gears":[["id":"legacy", "retired":true], ["id":"parent", "retired":true], ["id":"child"]],
+            "events":[["id":"mount", "gearId":"child", "parentId":"parent", "at":"2024-01-01T00:00:00"]],
+            "gearStates":[["id":"restore", "gearId":"legacy", "status":"active", "at":"2024-02-01T00:00:00"],
+                          ["id":"retire", "gearId":"legacy", "status":"retired", "at":"2024-03-01T00:00:00"]]
+        ]
+        XCTAssertEqual(GearInventory.readOwnStatus(state: state, gearID: "legacy", at: "2024-01-15T00:00:00"), "retired")
+        XCTAssertEqual(GearInventory.readOwnStatus(state: state, gearID: "legacy", at: "2024-02-15T00:00:00"), "active")
+        XCTAssertEqual(GearInventory.readOwnStatus(state: state, gearID: "legacy", at: "2024-03-15T00:00:00"), "retired")
+        XCTAssertEqual(GearInventory.readOwnStatus(state: state, gearID: "child", at: "2024-02-15T00:00:00"), "active")
+        XCTAssertEqual(GearInventory.readStatus(state: state, gearID: "child", at: "2024-02-15T00:00:00"), "retired")
     }
     func testTimelineGroupsReplacementAndSnapshotDoesNotLeakIt() throws {
         let s = try Session(), op = try s.run("inventory-save", s.replacement())

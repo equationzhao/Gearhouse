@@ -1,6 +1,7 @@
 import {readGearStatus} from './gear-state.mjs';
-import {uid,clone,ensure,installationDate,nowLocal,treeValid,activateMovedGear} from './domain.mjs';
-const records=(s,id)=>s.events.filter(e=>e.gearId===id).sort((a,b)=>a.at.localeCompare(b.at));
+import {uid,clone,ensure,installationTime,nowLocal,treeValid,activateMovedGear} from './domain.mjs';
+import {compareTimeline} from './timeline-time.mjs';
+const records=(s,id)=>s.events.filter(e=>e.gearId===id).sort(compareTimeline);
 function install(s,gearId,events){
  const next=s.events.filter(e=>e.gearId!==gearId).concat(events);
  ensure(treeValid(s,next),'所属装备不能是自身或子装备（含后续历史关系）');
@@ -12,25 +13,26 @@ function record(s,gearId,before,action){
 }
 export function saveInstallation(s,input){
  ensure(s.gears.some(g=>g.id===input.gearId&&!g.deletedAt),'装备不存在或已删除');
- const at=installationDate(input.at);ensure(at<=nowLocal(),'不能设置未来的装配时间');
+ const time=installationTime(input.at,input.instant),at=time.at;ensure(time.instant||at<=nowLocal(),'不能设置未来的装配时间');
  ensure(input.parentId===null||s.gears.some(g=>g.id===input.parentId&&!g.deletedAt),'所属装备不存在或已删除');
  const before=clone(records(s,input.gearId));
- const boundary=before.find(e=>e.id===input.id)?.at||at;
- ensure(!(s.gearOperations||[]).some(op=>op.gearIds.includes(input.gearId)&&op.at>=(boundary<at?boundary:at)),'请通过更换或库存记录修改这次装配。');
+ const original=before.find(e=>e.id===input.id),boundary=original&&compareTimeline(original,time)<0?original:time;
+ ensure(!(s.gearOperations||[]).some(op=>op.gearIds.includes(input.gearId)&&compareTimeline(op,boundary)>=0),'请通过更换或库存记录修改这次装配。');
  if(input.id)ensure(before.some(e=>e.id===input.id),'装配记录不存在');
  ensure(!before.some(e=>e.id===input.id&&e.operationId),'请通过更换或库存记录修改这次装配。');
- ensure(!before.some(e=>e.id!==input.id&&e.at.slice(0,10)===at.slice(0,10)),'当天已有装配记录，请编辑原记录。');
- const event={id:input.id||uid(),gearId:input.gearId,parentId:input.parentId,at,allDay:true};
- const status=input.parentId===null&&readGearStatus(s,input.gearId,at)==='stock'?'stock':'active';
+ ensure(!before.some(e=>e.id!==input.id&&e.at.slice(0,10)===at.slice(0,10)&&
+  (time.allDay||e.instant===time.instant||(!e.instant&&e.at===at))),time.allDay?'当天已有装配记录，请编辑原记录。':'生效时间已有装配记录，请编辑原记录。');
+ const event={id:input.id||uid(),gearId:input.gearId,parentId:input.parentId,...time};
+ const status=input.parentId===null&&readGearStatus(s,input.gearId,at,true,undefined,time.instant)==='stock'?'stock':'active';
  install(s,input.gearId,before.filter(e=>e.id!==input.id).concat(event));
  s.gearStates=(s.gearStates||[]).filter(e=>e.installationId!==event.id);
- activateMovedGear(s,input.gearId,at,event.id,status);
+ activateMovedGear(s,input.gearId,at,event.id,status,time.instant);
  record(s,input.gearId,before,input.id?'编辑':'新增');return event;
 }
 export function deleteInstallation(s,{gearId,id}){
  ensure(s.gears.some(g=>g.id===gearId&&!g.deletedAt),'装备不存在或已删除');
  const before=clone(records(s,gearId));ensure(before.some(e=>e.id===id),'装配记录不存在');
- ensure(!(s.gearOperations||[]).some(op=>op.gearIds.includes(gearId)&&op.at>=before.find(e=>e.id===id).at),'请通过更换或库存记录修改这次装配。');
+ ensure(!(s.gearOperations||[]).some(op=>op.gearIds.includes(gearId)&&compareTimeline(op,before.find(e=>e.id===id))>=0),'请通过更换或库存记录修改这次装配。');
  ensure(!before.some(e=>e.id===id&&e.operationId),'请通过更换或库存记录修改这次装配。');
  s.gearStates=(s.gearStates||[]).filter(e=>e.installationId!==id);
  install(s,gearId,before.filter(e=>e.id!==id));record(s,gearId,before,'删除');return {ok:true};

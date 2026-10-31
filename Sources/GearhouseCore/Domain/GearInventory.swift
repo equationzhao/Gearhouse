@@ -40,19 +40,29 @@ public enum GearInventory {
         }
         return result
     }
-    public static func readStatus(state: Value, gearID: String, at: String) -> String {
+    public static func readOwnStatus(state: Value, gearID: String, at: String, instant: String? = nil) -> String {
+        let gear = state["gears"].array.first { $0.id == gearID } ?? [:]
+        var latest: Value?
+        for row in state["gearStates"].array where row["gearId"].text == gearID && GearTimelineTime.applies(row, at: at, instant: instant) {
+            if latest == nil || GearTimelineTime.compare(latest!, row) <= 0 { latest = row }
+        }
+        return readOwnStatus(gear: gear, latest: latest, at: at)
+    }
+    private static func readOwnStatus(gear: Value, latest: Value?, at: String) -> String {
+        let retired = gear["retired"].flag && (gear["retiredAt"].isNull || gear["retiredAt"].text <= at)
+        return latest?["status"].text ?? (retired ? "retired" : "active")
+    }
+    public static func readStatus(state: Value, gearID: String, at: String, instant: String? = nil) -> String {
         let gears = Dictionary(state["gears"].array.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
-        let parents = GearTreeIndex(gears: state["gears"].array, events: state["events"].array, at: at).parents
+        let parents = GearTreeIndex(gears: state["gears"].array, events: state["events"].array, at: at, instant: instant).parents
         var latest: [String: Value] = [:]
-        for row in state["gearStates"].array where row["at"].text <= at {
+        for row in state["gearStates"].array where GearTimelineTime.applies(row, at: at, instant: instant) {
             let id = row["gearId"].text
-            if latest[id] == nil || latest[id]!["at"].text <= row["at"].text { latest[id] = row }
+            if latest[id] == nil || GearTimelineTime.compare(latest[id]!, row) <= 0 { latest[id] = row }
         }
         var current = gearID, seen = Set<String>()
         while !current.isEmpty && seen.insert(current).inserted {
-            let gear = gears[current] ?? [:]
-            let retired = gear["retired"].flag && (gear["retiredAt"].isNull || gear["retiredAt"].text <= at)
-            let status = latest[current]?["status"].text ?? (retired ? "retired" : "active")
+            let status = readOwnStatus(gear: gears[current] ?? [:], latest: latest[current], at: at)
             if status == "retired" { return status }
             guard let parent = parents[current], !parent.isEmpty else { return status }
             current = parent

@@ -1,16 +1,16 @@
-import {readGearStatuses,readInventoryConflict} from './lib/gear-state.mjs';
+import {buildGearStateIndex,readGearStatuses,readInventoryConflict} from './lib/gear-state.mjs';
 import {validateInventory,saveInventoryGear,readOperationOptions,previewGearOperation,applyGearOperation,previewOperationDeletion,deleteGearOperation,previewInventoryBatch,storeInventoryBatch} from './lib/inventory.mjs';
 import {ensureCategories,saveCategory,deleteCategory} from './lib/categories.mjs';
-import {empty,clone,ensure,nowLocal,installationDate,migrateInstallationDates,saveGear,deleteGear,restoreGear,batchMove,saveAssignment,importGear,mergeActivities,stats,treeValid} from './lib/domain.mjs';
+import {empty,clone,ensure,nowLocal,installationDate,migrateInstallationDates,saveGear,deleteGear,restoreGear,batchMove,saveAssignment,importGear,mergeActivities,stats,treeValid,observeActivityGear,refreshRemoteGears,reconcileActivityMappings,activityInstant,activityTimeUncertain,shanghaiTime} from './lib/domain.mjs';
 import {saveInstallation,deleteInstallation} from './lib/history.mjs';
 import {previewOrganization,applyOrganization} from './lib/organize.mjs';
-import {previewRecompute,applyRecompute} from './lib/recompute.mjs';
+import {previewRecompute,applyRecompute,undoRecompute} from './lib/recompute.mjs';
 import {previewPurge,purgeGear} from './lib/purge.mjs';
-import {mutateGearEvent,eventMetrics} from './lib/gear-events.mjs';
-import {addPhoto,editPhotos,attachEventPhotos,prunePhotos} from './lib/photos.mjs';
+import {mutateGearEvent} from './lib/gear-events.mjs';
+import {PHOTO_LIMIT,addPhoto,editPhotos,attachEventPhotos,prunePhotos} from './lib/photos.mjs';
 import {createComponent} from './lib/components.mjs';
 import {addAttachment,deleteAttachment} from './lib/attachments.mjs';
-import {buildSnapshot} from './public/snapshot.js';
+import {buildSnapshot,buildActivityIndex,calculateEventMetrics} from './public/snapshot.js';
 import {gearActivityRows,filterUsageRange,summarizeUsage} from './public/gear-activities.js';
 import {syncPlan,retryDelay} from './lib/auto-sync.mjs';
 import {applyConfirmedDeletions} from './lib/activity-deletions.mjs';
@@ -25,16 +25,18 @@ function normalized(raw){
   s.events=s.gears.filter(g=>g.parentID).map(g=>({id: nativeUUID(),gearId:g.id,parentId:g.parentID,at:'2000-01-01T00:00:00'}));
   s.activities=(raw.activities||[]).map(a=>({...a,at:(a.at||'').replace(/Z$/,'').slice(0,19),main:a.mainGearID||null,remoteId:a.remoteGearID||null,extras:[],excluded:[],snapshot:a.mainGearID?[{id:a.mainGearID,parentId:null,...(a.equipmentDistanceIncluded===false?{distanceIncluded:false}:{})}]:[],equipmentDistance:a.equipmentDistanceIncluded,manual:false}));
   // Prototype dates were absolute ISO instants; restore the canonical Shanghai wall clock.
-  s.activities.forEach((a,i)=>{const d=Date.parse(raw.activities[i].at);if(Number.isFinite(d))a.at=new Date(d+8*3600000).toISOString().slice(0,19);});
+  s.activities.forEach((a,i)=>{a.startInstant=activityInstant(raw.activities[i].at);if(a.startInstant)a.at=shanghaiTime(a.startInstant);});
   s.nativePrototypeMigration=true;return s;
  }
  ensure(Array.isArray(raw.gears)&&Array.isArray(raw.activities),'备份数据无效');
+ for(const a of raw.activities)if(a.startInstant!==undefined&&a.startInstant!==null)ensure(activityInstant(a.startInstant)===a.startInstant,'活动时间无效，请选择完整备份。');
  delete raw.configs;raw.gearEvents??=[];raw.photos??=[];raw.syncLog??=[];raw.remoteGears??=[];
  ensure(treeValid(raw,raw.events),'装配历史存在环路');return raw;
 }
 function view(s,date){
- if(date){const snapshot=buildSnapshot(s,date,nowLocal());return {...snapshot,gearStatuses:readGearStatuses(snapshot,snapshot.snapshotView.cutoff)};}
- return {...s,gearStatuses:readGearStatuses(s,nowLocal()),inventoryConflicts:s.activities.filter(a=>!a.deleted&&a.at&&readInventoryConflict(s,a)).map(a=>a.id),statistics:Object.fromEntries(s.gears.map(g=>[g.id,stats(s,g.id)])),eventStatistics:Object.fromEntries((s.gearEvents||[]).map(e=>[e.id,eventMetrics(s,e)]))};
+ if(date){const snapshot=buildSnapshot(s,date,nowLocal());return {...snapshot,gearStatuses:readGearStatuses(snapshot,snapshot.snapshotView.cutoff,buildGearStateIndex(snapshot))};}
+ const now=nowLocal(),activityIndex=buildActivityIndex(s),gearStateIndex=buildGearStateIndex(s);
+ return {...s,gearStatuses:readGearStatuses(s,now,gearStateIndex),inventoryConflicts:s.activities.filter(a=>!a.deleted&&a.at&&readInventoryConflict(s,a,gearStateIndex)).map(a=>a.id),statistics:Object.fromEntries(s.gears.map(g=>[g.id,stats(s,g.id,activityIndex)])),eventStatistics:Object.fromEntries((s.gearEvents||[]).map(e=>[e.id,calculateEventMetrics(s,e,now,activityIndex)]))};
 }
 export function call(serialized){
  try{
@@ -44,9 +46,10 @@ export function call(serialized){
    case 'initialize':migrateInstallationDates(s);break;
    case 'view':return JSON.stringify({result:view(s,input.date)});
    case 'usage':{const rows=filterUsageRange(gearActivityRows(input.date?buildSnapshot(s,input.date,nowLocal()):s,input.id),input);return JSON.stringify({result:{rows,summary:summarizeUsage(rows)}});}
+   case 'activity-statuses':{const a=s.activities.find(a=>a.id===input.id);ensure(a,'活动不存在');return JSON.stringify({result:{uncertain:activityTimeUncertain(s,a),statuses:readGearStatuses(s,a.at,undefined,a.startInstant)}});}
    case 'category-save':result=saveCategory(s,input);break;
    case 'category-delete':result=deleteCategory(s,input);break;
-   case 'gear':result=saveInventoryGear(s,input);break;
+   case 'gear':result=saveInventoryGear(s,input);reconcileActivityMappings(s);break;
    case 'inventory-options':result=readOperationOptions(s,input);mutate=false;break;
    case 'inventory-preview':result=previewGearOperation(s,input);mutate=false;break;
    case 'inventory-batch-preview':result=previewInventoryBatch(s,input);mutate=false;break;
@@ -63,23 +66,36 @@ export function call(serialized){
    case 'delete':result=deleteGear(s,input.id);break;
    case 'restore':result=restoreGear(s,input.id);break;
    case 'hidden':{const g=s.gears.find(g=>g.id===input.id&&!g.deletedAt);ensure(g,'装备不存在');g.hidden=!!input.hidden;break;}
-   case 'moves':batchMove(s,input.changes,input.at);result={ok:true};break;
+   case 'moves':batchMove(s,input.changes,input.at,input.instant);result={ok:true};break;
    case 'history-save':result=saveInstallation(s,input);break;
    case 'history-delete':result=deleteInstallation(s,input);break;
    case 'organize-preview':result=previewOrganization(s,input.changes);mutate=false;break;
    case 'organize':result=applyOrganization(s,input.changes);break;
    case 'recompute-preview':result=previewRecompute(s,input);mutate=false;break;
    case 'recompute':{const p=previewRecompute(s,input);ensure(!p.totals.some(t=>t.baselineDisabled)||input.baselineConfirmed,'请确认停用 ICU 历史基数');result=applyRecompute(s,input);break;}
+   case 'recompute-undo':result=undoRecompute(s,input.id);break;
    case 'purge-preview':result=previewPurge(s,input.id);mutate=false;break;
    case 'purge':result=purgeGear(s,input);break;
    case 'event-save':result=mutateGearEvent(s,'save',input);attachEventPhotos(s,result.id,input.event);break;
    case 'event-delete':result=mutateGearEvent(s,'delete',input);break;
    case 'photo-add':result=addPhoto(s,input,input.metadata);break;
+   case 'photo-add-batch':{
+    ensure(Array.isArray(input.records)&&input.records.length>0,'请选择有效的图片');
+    ensure(input.records.length<=PHOTO_LIMIT,'最多添加 40 张图片');
+    result=input.records.map(record=>addPhoto(s,record,record.metadata));break;
+   }
    case 'photo-edit':result=editPhotos(s,input);break;
    case 'attachment-add':result=addAttachment(s,input);break;
    case 'attachment-delete':result=deleteAttachment(s,input);break;
    case 'assignment-preview':result=saveAssignment(s,input.id,input.assignment);mutate=false;break;
    case 'assignment':result=saveAssignment(s,input.id,input.assignment);break;
+   case 'assignment-observe':result=observeActivityGear(s,input);break;
+   case 'assignment-rebase':{
+    const a=s.activities.find(a=>a.id===input.id);ensure(a&&a.pending,'活动已有后续修改');
+    ensure((a.remoteId||null)===(input.remoteId||null),'ICU 主装备已变化，请重新选择。');
+    a.mainSyncBase=a.remoteId||null;a.mainConflict=false;delete a.mainResolutionRequired;break;
+   }
+   case 'gear-refresh':result=refreshRemoteGears(s,input.rows);break;
    case 'account':ensure(input.id,'账户无效');ensure(!s.account||s.account.id===input.id,'此数据库属于其他 ICU 账户');s.account=input;break;
    case 'gear-import':{
     result=importGear(s,input.rows);
@@ -112,7 +128,7 @@ export function call(serialized){
     s.syncLog.unshift({...s.lastSync,...result});s.syncLog=s.syncLog.slice(0,1000);
     if(input.saveResume!==false)s.autoSync={...(s.autoSync||{}),resume:{next:input.next}};break;
    }
-   case 'write-result':{const a=s.activities.find(a=>a.id===input.id);ensure(a,'活动不存在');if(input.error)a.error=input.error;else {ensure((a.main||null)===(input.main||null),'活动已有后续修改');a.remoteId=input.target;a.pending=false;a.error=null;a.lastWriteAt=new Date().toISOString();}break;}
+   case 'write-result':{const a=s.activities.find(a=>a.id===input.id);ensure(a,'活动不存在');ensure(!input.editId||a.mainEditId===input.editId,'活动已有后续修改');if(input.error)a.error=input.error;else {ensure((a.main||null)===(input.main||null),'活动已有后续修改');a.remoteId=input.target;a.mainSyncBase=input.target;a.pending=false;a.mainConflict=false;delete a.mainResolutionRequired;a.error=null;a.lastWriteAt=new Date().toISOString();}break;}
    default:throw Error('未知操作');
   }
   if(mutate){prunePhotos(s);s.revision=(s.revision||0)+1;}

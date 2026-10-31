@@ -24,6 +24,41 @@ public struct GearReminder: Codable, Identifiable, Equatable, Sendable {
     public var generation = UUID().uuidString
     public init(gearID: String) { self.gearID = gearID }
 
+    public func prepareEdit(replacing existing: GearReminder?, now: Date = Date()) -> GearReminder {
+        var next = self
+        next.title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if existing == nil || existing?.mode != mode || (mode == .usage && anchor == .now && existing?.anchor != .now) {
+            next.startedAt = now
+        }
+        if mode == .total && (existing?.kilometers != kilometers || existing?.repeatKilometers == nil) {
+            next.repeatKilometers = kilometers
+        }
+        if let existing, next.matchesConfiguration(of: existing) {
+            next.generation = existing.generation
+            next.completedCycle = existing.completedCycle
+            next.snoozedCycle = existing.snoozedCycle
+            next.snoozedUntil = existing.snoozedUntil
+        } else {
+            next.generation = UUID().uuidString
+            next.completedCycle = nil
+            next.snoozedCycle = nil
+            next.snoozedUntil = nil
+        }
+        return next
+    }
+    private func matchesConfiguration(of other: GearReminder) -> Bool {
+        guard gearID == other.gearID, mode == other.mode, repeats == other.repeats, enabled == other.enabled else { return false }
+        switch mode {
+        case .total: return kilometers == other.kilometers
+        case .date: return date == other.date && (!repeats || days == other.days)
+        case .usage:
+            guard kilometers == other.kilometers, days == other.days, anchor == other.anchor else { return false }
+            if anchor != .now { return anchorID == other.anchorID }
+            return startedAt == other.startedAt && eventKind == other.eventKind
+                && (eventKind != "custom" || eventCustomName == other.eventCustomName)
+        }
+    }
+
     public func copyRule(to gearID: String, state: Value, now: Date = Date()) -> GearReminder {
         var copy = self
         copy.id = UUID().uuidString; copy.gearID = gearID; copy.generation = UUID().uuidString
@@ -47,6 +82,25 @@ public struct GearReminder: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
+public struct ReminderProgressMetric: Equatable, Sendable {
+    public let current: Double
+    public let target: Double
+
+    public var fraction: Double {
+        guard current.isFinite, target.isFinite, target > 0 else { return 0 }
+        return min(1, max(0, current / target))
+    }
+}
+
+public struct ReminderProgress: Equatable, Sendable {
+    /// Distance is measured in meters, matching reminder evaluation and activity data.
+    public let distance: ReminderProgressMetric?
+    public let days: ReminderProgressMetric?
+    public let startedAt: Date?
+    /// The original deadline remains available even after a reminder is due or snoozed.
+    public let deadline: Date?
+}
+
 public struct ReminderOccurrence: Equatable, Sendable {
     public var cycle: String
     public var due: Bool
@@ -56,11 +110,24 @@ public struct ReminderOccurrence: Equatable, Sendable {
     public var issue: String?
     public var eventKind: String?
     public var eventCustomName: String?
+    public var progress: ReminderProgress?
+    public var paused = false
+
+    public enum Group: Int, CaseIterable, Sendable {
+        case due, needsReview, upcoming, snoozed, inactive
+    }
+
+    public func readGroup(for reminder: GearReminder, now: Date = Date()) -> Group {
+        if !reminder.enabled || paused || reminder.completedCycle == cycle { return .inactive }
+        if issue != nil { return .needsReview }
+        if reminder.snoozedCycle == cycle, let until = reminder.snoozedUntil, until > now { return .snoozed }
+        return due ? .due : .upcoming
+    }
 }
 
 /// Shared by reminders for one saved state, including when viewing an old snapshot.
 public struct GearReminderActivityIndex: Sendable {
-    private struct Entry: Sendable { let at: Date; let distance: Double }
+    private struct Entry: Sendable { let at: Date; let instant: Date?; let distance: Double }
     private var byGear: [String: [Entry]] = [:]
     public init(_ activities: [Value]) {
         var seen = Set<String>()
@@ -70,17 +137,25 @@ public struct GearReminderActivityIndex: Sendable {
             var memberships = Set<String>()
             for row in activity["snapshot"].array {
                 guard memberships.insert(row.id).inserted, row["distanceIncluded"] != false else { continue }
-                byGear[row.id, default: []].append(Entry(at: at, distance: max(0, activity["distance"].double)))
+                byGear[row.id, default: []].append(Entry(at: at, instant: GearReminderEngine.parseInstant(activity["startInstant"].text), distance: max(0, activity["distance"].double)))
             }
         }
     }
-    func distance(for gear: String, from: Date, through: Date) -> Double {
-        (byGear[gear] ?? []).reduce(0) { $0 + ($1.at >= from && $1.at <= through ? $1.distance : 0) }
+    func distance(for gear: String, from: Date, through: Date, precise: Bool = false) -> (value: Double, uncertain: Bool) {
+        var total = 0.0, uncertain = false
+        for entry in byGear[gear] ?? [] {
+            if precise && entry.instant == nil && (abs(entry.at.timeIntervalSince(from)) <= 2 * 86400 || abs(entry.at.timeIntervalSince(through)) <= 2 * 86400) { uncertain = true; continue }
+            let at = precise ? (entry.instant ?? entry.at) : entry.at
+            if at >= from && at <= through { total += entry.distance }
+        }
+        return (total, uncertain)
     }
 }
 
 public enum GearReminderEngine {
     public static var calendar: Calendar { var c = Calendar(identifier: .gregorian); c.timeZone = TimeZone(identifier: "Asia/Shanghai")!; return c }
+    private static let isoFractional: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f }()
+    private static let isoPlain = ISO8601DateFormatter()
     private static let formatters = NSCache<NSString, DateFormatter>()
     private static func formatter(_ pattern: String) -> DateFormatter {
         if let existing = formatters.object(forKey: pattern as NSString) { return existing }
@@ -91,6 +166,11 @@ public enum GearReminderEngine {
     public static func parse(_ text: String) -> Date? {
         formatter(text.count <= 10 ? "yyyy-MM-dd" : "yyyy-MM-dd'T'HH:mm:ss").date(from: text.count == 16 ? text + ":00" : text)
     }
+    public static func parseInstant(_ text: String) -> Date? {
+        guard !text.isEmpty else { return nil }
+        return isoFractional.date(from: text) ?? isoPlain.date(from: text)
+    }
+    private static func instant(_ date: Date) -> String { isoFractional.string(from: date) }
     public static func wall(_ date: Date) -> String { formatter("yyyy-MM-dd'T'HH:mm:ss").string(from: date) }
     public static func eventDate(_ event: Value) -> Date? {
         if event["occurredTime"].isNull { return parse(event["occurredDate"].text).flatMap { calendar.date(byAdding: .day, value: 1, to: $0) } }
@@ -98,9 +178,9 @@ public enum GearReminderEngine {
     }
     public static func evaluate(_ r: GearReminder, state: Value, total: Double, now: Date = Date(), activities: GearReminderActivityIndex? = nil) -> ReminderOccurrence {
         var result = ReminderOccurrence(cycle: r.generation, due: false, fireDate: nil, distance: 0, remaining: 0)
-        guard r.enabled else { result.issue = !r.repeats && r.completedCycle != nil ? "已完成" : "已暂停"; return result }
-        guard let gear = state["gears"].array.first(where: { $0.id == r.gearID }), gear["deletedAt"].isNull else { result.issue = "装备已移入回收站，提醒已暂停"; return result }
-        guard GearInventory.readStatus(state: state, gearID: r.gearID, at: wall(now)) != "retired" else { result.issue = "装备已退役，提醒已暂停"; return result }
+        guard r.enabled else { result.paused = true; result.issue = !r.repeats && r.completedCycle != nil ? "已完成" : "已暂停"; return result }
+        guard let gear = state["gears"].array.first(where: { $0.id == r.gearID }), gear["deletedAt"].isNull else { result.paused = true; result.issue = "装备已移入回收站，提醒已暂停"; return result }
+        guard GearInventory.readStatus(state: state, gearID: r.gearID, at: wall(now), instant: instant(now)) != "retired" else { result.paused = true; result.issue = "装备已退役，提醒已暂停"; return result }
         if r.mode == .date {
             var date = r.date
             if r.repeats, r.days > 0, date < now {
@@ -114,8 +194,10 @@ public enum GearReminderEngine {
                 result.cycle = r.generation + ":" + wall(date)
             }
             result.fireDate = date; result.due = date <= now
+            result.progress = ReminderProgress(distance: nil, days: nil, startedAt: nil, deadline: date)
         } else {
             var start = r.startedAt
+            var preciseStart = false
             var dayOrigin: Date?
             if r.mode == .usage && (r.anchor == .event || r.eventKind != nil) {
                 let selected = r.anchor == .event
@@ -138,30 +220,50 @@ public enum GearReminderEngine {
                 result.eventKind = event["kind"].text; result.eventCustomName = event["customName"].text
                 }
             } else if r.mode == .usage && r.anchor == .installation {
-                guard let event = state["events"].array.first(where: { $0.id == r.anchorID && $0["gearId"].text == r.gearID }), let date = parse(event["at"].text) else { result.issue = "装配记录已删除，请重新选择"; return result }
-                start = date; result.cycle += ":" + event.id + ":" + wall(date)
+                guard let event = state["events"].array.first(where: { $0.id == r.anchorID && $0["gearId"].text == r.gearID }), let date = event["instant"].isNull ? parse(event["at"].text) : parseInstant(event["instant"].text) else { result.issue = "装配记录已删除，请重新选择"; return result }
+                preciseStart = !event["instant"].isNull
+                start = date; result.cycle += ":" + event.id + ":" + (preciseStart ? event["instant"].text : wall(date))
             }
             if r.mode == .total { result.distance = total }
-            else if let activities { result.distance = activities.distance(for: r.gearID, from: start, through: now) }
+            else if let activities {
+                let usage = activities.distance(for: r.gearID, from: start, through: now, precise: preciseStart)
+                result.distance = usage.value
+                if usage.uncertain { result.issue = "活动缺少可靠开始时刻，请同步后核对提醒。" }
+            }
             else {
                 var seen = Set<String>()
                 for a in state["activities"].array {
                     guard seen.insert(a.id).inserted, !a["deleted"].flag, !a["summary"].flag, !a["unavailable"].flag,
                           let membership = a["snapshot"].array.first(where: { $0.id == r.gearID }), membership["distanceIncluded"] != false,
-                          let at = parse(a["at"].text), at >= start, at <= now else { continue }
+                          let local = parse(a["at"].text) else { continue }
+                    let instant = parseInstant(a["startInstant"].text)
+                    if preciseStart && instant == nil && (abs(local.timeIntervalSince(start)) <= 2 * 86400 || abs(local.timeIntervalSince(now)) <= 2 * 86400) { result.issue = "活动缺少可靠开始时刻，请同步后核对提醒。"; continue }
+                    let at = preciseStart ? (instant ?? local) : local
+                    guard at >= start, at <= now else { continue }
                     result.distance += max(0, a["distance"].double)
                 }
             }
             result.remaining = max(0, r.kilometers * 1000 - result.distance)
             result.due = r.kilometers > 0 && result.remaining == 0
+            var elapsedDays: ReminderProgressMetric?
+            var deadline: Date?
             if r.mode == .usage && r.days > 0 {
-                let deadline = calendar.date(byAdding: .day, value: r.days, to: dayOrigin ?? start)!
-                result.fireDate = deadline
-                result.due = result.due || deadline <= now
+                let origin = dayOrigin ?? start
+                let date = calendar.date(byAdding: .day, value: r.days, to: origin)!
+                deadline = date
+                elapsedDays = ReminderProgressMetric(current: Double(max(0, calendar.dateComponents([.day], from: origin, to: now).day ?? 0)), target: Double(r.days))
+                result.fireDate = date
+                result.due = result.due || date <= now
             }
+            result.progress = ReminderProgress(
+                distance: r.kilometers > 0 ? ReminderProgressMetric(current: result.distance, target: r.kilometers * 1000) : nil,
+                days: elapsedDays,
+                startedAt: r.mode == .usage ? dayOrigin ?? start : nil,
+                deadline: deadline
+            )
             if result.due { result.fireDate = now }
         }
-        if r.completedCycle == result.cycle { result.issue = "已完成"; result.due = false; result.fireDate = nil }
+        if r.completedCycle == result.cycle { result.issue = "已完成"; result.due = false; result.fireDate = nil; result.progress = nil }
         if r.snoozedCycle == result.cycle, let until = r.snoozedUntil, result.fireDate != nil { result.fireDate = max(result.fireDate!, until) }
         return result
     }

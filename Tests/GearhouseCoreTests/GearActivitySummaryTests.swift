@@ -2,6 +2,23 @@ import XCTest
 @testable import GearhouseCore
 
 final class GearActivitySummaryTests: XCTestCase {
+    func testActivityFiltersCombineTypeAndAssignmentWithoutTreatingLocalStravaAsPending() {
+        let rows: [Value] = [
+            ["id": "linked", "type": "Ride", "main": "bike", "remoteId": "remote"],
+            ["id": "unlinked", "type": "Ride", "remoteId": "missing"],
+            ["id": "indoor", "type": "VirtualRide", "remoteId": "missing"],
+            ["id": "none", "type": "Ride"],
+            ["id": "pending", "type": "Ride", "pending": true, "mainConflict": true],
+            ["id": "local", "type": "Ride", "pending": true, "source": "strava"],
+            ["id": "deleted", "type": "Ride", "pending": true, "deleted": true]
+        ]
+        XCTAssertEqual(rows.filter(GearActivityFilter(type: "Ride", assignment: .unlinked).matchesActivity).map(\.id), ["unlinked"])
+        XCTAssertEqual(rows.filter(GearActivityFilter(assignment: .unlinked).matchesActivity).map(\.id), ["unlinked", "indoor"])
+        XCTAssertEqual(rows.filter(GearActivityFilter(assignment: .pending).matchesActivity).map(\.id), ["pending"])
+        XCTAssertFalse(GearActivityFilter().isActive)
+        XCTAssertTrue(GearActivityFilter(type: "VirtualRide").isActive)
+        XCTAssertEqual(rows.filter(GearActivityFilter().matchesActivity).count, 6)
+    }
     private func date(_ value: String) -> Date { ISO8601DateFormatter().date(from: value)! }
     func testInclusiveDaysAndGearMembership() throws {
         var calendar = Calendar(identifier: .gregorian)

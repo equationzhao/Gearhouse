@@ -20,10 +20,21 @@ final class GearTreeDragUITests: XCTestCase {
     private func drag(_ id: String, onto name: String) {
         let handle = app.descendants(matching: .any)["gear-drag-" + id].firstMatch
         XCTAssertTrue(handle.waitForExistence(timeout: 5))
+        reveal(handle)
         XCTAssertTrue(handle.isHittable)
         let destination = app.staticTexts[name].firstMatch
         XCTAssertTrue(destination.isHittable)
         handle.press(forDuration: 0.3, thenDragTo: destination)
+    }
+
+    private func reveal(_ element: XCUIElement) {
+        for _ in 0..<10 {
+            let selection = app.staticTexts["gear-selection-count"]
+            let bottom = selection.exists && selection.isHittable ? selection.frame.minY - 16 : app.frame.maxY - 160
+            if element.isHittable && element.frame.maxY < bottom { return }
+            app.swipeUp()
+        }
+        XCTAssertTrue(element.isHittable)
     }
 
     private func save() {
@@ -66,6 +77,8 @@ final class GearTreeDragUITests: XCTestCase {
 
     func testSingleAndBatchDragOnDevice() {
         capture("initial-tree")
+        XCTAssertFalse(app.descendants(matching: .any)["gear-drag-pedals"].firstMatch.exists)
+        app.buttons["gear-multiselect"].tap()
         drag("pedals", onto: "Propel Advanced")
         XCTAssertTrue(app.staticTexts["1 项修改"].waitForExistence(timeout: 5))
         capture("single-pending")
@@ -73,8 +86,11 @@ final class GearTreeDragUITests: XCTestCase {
         capture("single-saved")
 
         app.buttons["gear-multiselect"].tap()
+        reveal(app.staticTexts["IRC Front"])
         app.staticTexts["IRC Front"].tap()
+        reveal(app.staticTexts["IRC Rear"])
         app.staticTexts["IRC Rear"].tap()
+        XCTAssertEqual(app.staticTexts["gear-selection-count"].label, "已选 2 件")
         capture("batch-selection")
         drag("front", onto: "Tarmac SL8 Pro")
         XCTAssertTrue(app.staticTexts["2 项修改"].waitForExistence(timeout: 5))

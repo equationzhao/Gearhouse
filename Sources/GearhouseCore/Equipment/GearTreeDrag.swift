@@ -49,6 +49,7 @@ public struct GearTreeDrag: Codable, Equatable, Sendable {
             if originalParents[id] == target { next.removeValue(forKey: id) }
             else { next[id] = target }
         }
+        guard next.count < 500 else { throw DomainError("每次最多调整 499 件装备，请先保存或撤销部分修改。") }
         return next
     }
 }

@@ -2,6 +2,15 @@ import XCTest
 @testable import GearhouseCore
 
 final class GearTreeIndexTests: XCTestCase {
+    func testRepeatedWallClockHourUsesAbsoluteEventOrder() {
+        let gears: [Value] = [["id":"a"], ["id":"b"], ["id":"wheel"]]
+        let first: Value = ["gearId":"wheel", "parentId":"a", "at":"1991-09-15T01:30:00", "instant":"1991-09-14T16:30:00.000Z", "allDay":false]
+        let second: Value = ["gearId":"wheel", "parentId":"b", "at":"1991-09-15T01:30:00", "instant":"1991-09-14T17:30:00.000Z", "allDay":false]
+        let between = GearTreeIndex(gears: gears, events: [second, first], at: "1991-09-15T01:45:00", instant: "1991-09-14T16:45:00.000Z")
+        XCTAssertEqual(between.parents["wheel"], "a")
+        let after = GearTreeIndex(gears: gears, events: [second, first], at: "1991-09-15T01:45:00", instant: "1991-09-14T17:45:00.000Z")
+        XCTAssertEqual(after.parents["wheel"], "b")
+    }
     private let gears: [Value] = [
         ["id":"bike", "name":"Tarmac"], ["id":"wheel", "name":"CL II"],
         ["id":"front", "name":"IRC Front"], ["id":"rear", "name":"IRC Rear"],

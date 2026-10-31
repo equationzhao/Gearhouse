@@ -24,13 +24,17 @@ struct NativeGearDragHandle: View {
     let name: String
     let changed: ([String], CGPoint) -> Void
     let ended: ([String], CGPoint) -> Void
+    let cancelled: () -> Void
+    let activate: () -> Void
     @GestureState private var dragging = false
     var body: some View {
-        Image(systemName: "line.3.horizontal")
-            .foregroundStyle(dragging ? Color.accentColor : Color.secondary)
-            .frame(width: 44, height: 44)
-            .contentShape(Rectangle())
-            .accessibilityLabel("拖动" + name)
+        Button(action: activate) {
+            Image(systemName: "line.3.horizontal")
+                .foregroundStyle(dragging ? Color.accentColor : NativeAppearance.secondaryText)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }.buttonStyle(.plain)
+            .accessibilityLabel("调整" + name + "的所属装备")
             .highPriorityGesture(
                 DragGesture(minimumDistance: 6, coordinateSpace: .global)
                     .updating($dragging) { _, state, _ in state = true }
@@ -41,6 +45,9 @@ struct NativeGearDragHandle: View {
                         ended(ids, $0.location)
                     }
             )
+            .onChange(of: dragging) { wasDragging, isDragging in
+                if wasDragging && !isDragging { cancelled() }
+            }
     }
 }
 

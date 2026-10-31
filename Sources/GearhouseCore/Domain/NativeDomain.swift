@@ -13,9 +13,9 @@ public enum Value: Codable, Equatable, Sendable, Identifiable, ExpressibleByDict
     public init(from decoder: Decoder) throws {
         let c = try decoder.singleValueContainer()
         if c.decodeNil() { self = .null }
+        else if let s = try? c.decode(String.self) { self = .string(s) }
         else if let b = try? c.decode(Bool.self) { self = .bool(b) }
         else if let n = try? c.decode(Double.self) { self = .number(n) }
-        else if let s = try? c.decode(String.self) { self = .string(s) }
         else if let a = try? c.decode([Value].self) { self = .array(a) }
         else { self = .object(try c.decode([String: Value].self)) }
     }
@@ -144,6 +144,12 @@ public enum UserFacingError {
         }
     }
     private static let replacements: [String: String] = [
+        "请先在装备编辑中关联 ICU 装备": "请先关联主装备，再上传到 ICU。",
+        "该活动不可通过 API 修改": "这条活动无法上传装备修改，请在 Intervals.icu 中修改。",
+        "Strava 来源活动不能通过 ICU API 修改": "Strava 来源的活动无法上传装备修改。",
+        "活动账户不匹配": "活动与当前账户不一致，请检查 Intervals.icu 连接。",
+        "ICU 未确认装备修改，请重试": "本机已保存，尚未确认 ICU 的修改结果，请重试。",
+        "正在同步该活动": "正在上传这条活动，请完成后重试。",
         "装备计算模块不可用": "无法载入装备数据，请重新打开 App。",
         "无法启动装备计算模块": "无法载入装备数据，请重新打开 App。",
         "装备计算模块缺失": "此版本无法载入装备数据，请更新 App。",
@@ -161,14 +167,8 @@ public enum UserFacingError {
         "请连接 Intervals.icu": "请先连接 Intervals.icu。",
         "请等待同步完成": "正在同步，请完成后重试。",
         "正在恢复备份，请完成后重试。": "正在恢复备份，请完成后重试。",
-        "正在同步该活动": "正在保存这条活动，请稍候。",
         "请返回当前后再修改": "历史快照无法修改，请先返回当前。",
-        "请先在装备编辑中关联 ICU 装备": "请先编辑该装备，选择对应的 Intervals.icu 装备。",
-        "该活动不可通过 API 修改": "暂不支持修改这条活动的主装备。",
-        "Strava 来源活动不能通过 ICU API 修改": "暂不支持修改 Strava 来源活动的主装备。",
-        "活动账户不匹配": "这条活动属于另一个账户，无法修改。",
         "ICU 主装备已在别处修改，请先同步活动": "Intervals.icu 上的主装备已更改，请同步活动后重试。",
-        "ICU 未确认装备修改，请重试": "尚未确认 Intervals.icu 上的装备修改，请重试同步。",
         "图片无效": "无法读取这张图片，请重新选择。",
         "图片过大": "处理后的图片超过 10 MB，请选择较小的图片。",
         "备份过大": "备份必须小于 500 MB，请选择较小的备份文件。",
@@ -223,6 +223,12 @@ public enum UserFacingError {
         "请选择有效的起点记录": "开始累计的记录已不可用，请重新选择。"
     ]
     private static let safeMessages: Set<String> = [
+        "无法读取本机数据，请重新读取或从备份恢复。", "无法保留本机原文件，请检查存储空间后重试恢复。",
+        "请重新连接 Intervals.icu 后再同步。",
+        "备份文件过大，无法导出为 JSON。请使用 iCloud Drive 自动备份。", "本机数据已恢复，请重新导出备份。",
+        "有备份尚未下载完成，请稍后重新读取。", "有备份无法读取，请重新读取或选择其他备份。",
+        "有备份尚未下载完成，另有备份无法读取。请稍后重新读取或选择其他备份。",
+        "ICU 主装备已变化，请重新选择。", "ICU 主装备已变化，请选择要保留的装备。", "请等待装备刷新完成。",
         "该日期已有更换或库存记录，请编辑原记录。",
         "已有后续装配或库存记录，请先处理后续记录。",
         "更换或库存记录已不存在，请重新打开。",
@@ -254,6 +260,8 @@ public enum UserFacingError {
         "备份附件与本机文件冲突，请重新选择备份。", "备份缺少附件或附件已损坏，请重新选择完整备份。",
         "请完成恢复或返回当前后再添加附件。",
         "请选择要移动的装备。", "无法读取拖动的装备，请重试。", "装备已不可用，请重新选择。",
+        "每次最多调整 499 件装备，请先保存或撤销部分修改。",
+        "每次最多调整 499 件装备，请减少选择后重试。",
         "无法读取装备类别，请选择完整备份。", "备份中的装备类别重复或损坏，请重新导出备份。",
         "备份中的装备类别名称重复或损坏，请重新导出备份。", "内置类别的基础类型不能修改。",
         "装备的类别已不存在，请检查备份。", "类别已不存在，请重新打开。", "请填写类别名称，最多 80 字。",

@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import ImageIO
 
 public struct GearBackupManifest: Codable, Equatable, Sendable, Identifiable {
     public struct Photo: Codable, Equatable, Sendable {
@@ -74,6 +75,12 @@ public enum GearBackupArchive {
         if !attachments.isEmpty { manifest.attachments = attachments }
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .millisecondsSince1970
         try encoder.encode(manifest).write(to: partial.appendingPathComponent("manifest.json"), options: .atomic)
+        // Apply package integrity and image checks before publishing the version.
+        _ = try validate(at: partial)
+        for photo in photos {
+            guard let image = CGImageSourceCreateWithURL(partial.appendingPathComponent("media/" + photo.id + ".jpg") as CFURL, nil),
+                  CGImageSourceGetCount(image) > 0 else { throw DomainError("备份图片校验失败") }
+        }
         try fm.moveItem(at: partial, to: complete)
         return complete
     }

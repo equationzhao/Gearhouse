@@ -1,16 +1,27 @@
 import XCTest
 import CryptoKit
+import CoreGraphics
+import ImageIO
 @testable import GearhouseCore
 
 final class GearBackupArchiveTests: XCTestCase {
     private var root: URL!
+    private func imageData() throws -> Data {
+        let context = try XCTUnwrap(CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let image = try XCTUnwrap(context.makeImage())
+        let data = NSMutableData()
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, image, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        return data as Data
+    }
     override func setUpWithError() throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("GearBackupTests-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root.appendingPathComponent("media"), withIntermediateDirectories: true)
     }
     override func tearDownWithError() throws { try FileManager.default.removeItem(at: root) }
     private func fixture() throws -> Value {
-        let id = UUID().uuidString.lowercased(), image = Data([0xff, 0xd8, 0xff, 0xd9])
+        let id = UUID().uuidString.lowercased(), image = try imageData()
         let path = root.appendingPathComponent("media/" + id + ".jpg")
         try image.write(to: path)
         return ["account":["id":"athlete"], "gears":[["id":"chain", "categoryId":"Chain"]],
@@ -57,11 +68,13 @@ final class GearBackupArchiveTests: XCTestCase {
         XCTAssertEqual(restored.manifest.accountID, "athlete")
         XCTAssertEqual(restored.manifest.photos.count, 1)
         XCTAssertEqual(restored.manifest.records, 2)
-        XCTAssertEqual(try Data(contentsOf: url.appendingPathComponent("media/" + state["photos"].array[0].id + ".jpg")), Data([0xff, 0xd8, 0xff, 0xd9]))
+        XCTAssertEqual(try Data(contentsOf: url.appendingPathComponent("media/" + state["photos"].array[0].id + ".jpg")), try Data(contentsOf: root.appendingPathComponent("media/" + state["photos"].array[0].id + ".jpg")))
         XCTAssertFalse(try String(contentsOf: url.appendingPathComponent("state.json")).contains("base64"))
     }
     func testCorruptStateOrPhotoAndMissingMediaCannotBeRestored() throws {
         let state = try fixture()
+        let originalPhoto = root.appendingPathComponent("media/" + state["photos"].array[0].id + ".jpg")
+        let originalBytes = try Data(contentsOf: originalPhoto)
         let stateBackup = try make(state)
         try Data("{}".utf8).write(to: stateBackup.appendingPathComponent("state.json"))
         XCTAssertThrowsError(try GearBackupArchive.validate(at: stateBackup))
@@ -71,12 +84,31 @@ final class GearBackupArchiveTests: XCTestCase {
         XCTAssertThrowsError(try GearBackupArchive.validate(at: photoBackup))
         try FileManager.default.removeItem(at: photo)
         XCTAssertThrowsError(try GearBackupArchive.validate(at: photoBackup))
-        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("media/" + state["photos"].array[0].id + ".jpg")), Data([0xff, 0xd8, 0xff, 0xd9]))
+        XCTAssertEqual(try Data(contentsOf: originalPhoto), originalBytes)
     }
     func testFailedCreationDoesNotPublishAnIncompleteVersion() throws {
         var state = try fixture()
         var photos = state["photos"].array
         photos[0]["hash"] = "wrong"; state["photos"] = .array(photos)
+        XCTAssertThrowsError(try make(state))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("backups").path), [])
+    }
+    func testCreationRejectsPackagesThatCannotBeRestored() throws {
+        var state = try fixture()
+        let photo = state["photos"].array[0]
+        let source = root.appendingPathComponent("media/" + photo.id + ".jpg")
+        try Data().write(to: source)
+        state["photos"] = [["id": .string(photo.id), "hash": .string(try GearBackupArchive.hash(source))]]
+        XCTAssertThrowsError(try make(state))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("backups").path), [])
+
+        try Data([0xff, 0xd8, 0xff, 0xd9]).write(to: source)
+        state["photos"] = [["id": .string(photo.id), "hash": .string(try GearBackupArchive.hash(source))]]
+        XCTAssertThrowsError(try make(state))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("backups").path), [])
+
+        state["photos"] = []
+        state["events"] = .null
         XCTAssertThrowsError(try make(state))
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("backups").path), [])
     }

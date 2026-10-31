@@ -52,7 +52,14 @@ export function addPhoto(s,input,metadata){
  (s.photos??=[]).push(row);return row;
 }
 export function editPhotos(s,input){
- const {ownerType,ownerId,ids,action,id}=input;
+ const {ownerType,ownerId,ids,action,id,gearId}=input;
+ if(ownerType==='draft'){
+  ensure(action==='delete','草稿图片仅可移除。');
+  photoOwner(s,ownerType,ownerId,gearId);
+  const photo=ownerPhotos(s,ownerType,ownerId).find(p=>p.id===id);
+  ensure(input.confirmed===true&&photo&&photo.gearId===gearId,'无法移除图片，请重新打开记录后重试。');
+  s.photos=s.photos.filter(p=>p.id!==id);return {ok:true};
+ }
  ensure(['gear','activity'].includes(ownerType),'请通过编辑记录管理图片');
  photoOwner(s,ownerType,ownerId);
  const photos=ownerPhotos(s,ownerType,ownerId),photo=photos.find(p=>p.id===id);

@@ -21,7 +21,7 @@ struct GearhouseNativeApp: App {
     var body: some Scene {
         WindowGroup {
             NativeLaunchView().environmentObject(store).environment(\.timeZone, NativeDate.zone)
-                .sheet(item: $notifications.opened) { route in
+                .sheet(item: Binding(get: { store.hasLoadedState ? notifications.opened : nil }, set: { notifications.opened = $0 })) { route in
                     NavigationStack { NativeReminderDetail(id: route.id).toolbar { ToolbarItem(placement: .cancellationAction) { Button("关闭") { notifications.opened = nil } } } }.environmentObject(store)
                 }
                 .onChange(of: phase) { _, value in

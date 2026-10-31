@@ -7,6 +7,7 @@ import GearhouseCore
 struct NativeGearDetail: View {
     @EnvironmentObject var store: NativeStore
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let id: String
     var focusedHistoryID: String? = nil
     @State private var tab = "history"
@@ -30,87 +31,87 @@ struct NativeGearDetail: View {
     var body: some View {
         ScrollViewReader { proxy in
         List {
-            NativePhotoSection(owner: "gear", ownerID: id, gearID: id, readOnly: deleted || store.readOnly)
             Section {
-                Text(store.categoryName(for: gear)).foregroundStyle(.secondary)
-                LabeledContent("状态", value: GearInventory.describeStatus(store.status(id)))
-                if !store.conditionName(gear).isEmpty { LabeledContent("装备状况", value: store.conditionName(gear)) }
-                let metrics = store.view["statistics"][id]
-                LabeledContent("累计距离", value: nativeDistance(metrics["distance"]))
-                LabeledContent("累计时长", value: nativeDuration(metrics["seconds"]))
-                Button { tab = "activities" } label: { LabeledContent("活动", value: metrics["count"].isNull ? "—" : "\(metrics["count"].integer) 次") }
-                if !gear["notes"].text.isEmpty { Text(gear["notes"].text) }
+                NativeGearHero(gearID: id, readOnly: deleted || store.readOnly) { tab = "activities" }
+                    .listRowInsets(EdgeInsets()).listRowBackground(Color.clear).listRowSeparator(.hidden)
             }
-            if !deleted && !store.readOnly {
-                Section { NativeInventoryActions(gearID: id) { if $0 == "replace" { replacementParent = store.parent(id) }; editor = .init(kind: "inventory", item: ["kind": .string($0)], parent: id) } }
+            if tab == "history" { NativeReminderSection(gearID: id) }
+            Section {
+                Picker("内容", selection: $tab) { Text("历史").tag("history"); Text("活动").tag("activities") }.pickerStyle(.segmented)
+                    .listRowInsets(EdgeInsets()).listRowBackground(Color.clear).listRowSeparator(.hidden)
             }
-            NativeAttachmentSection(gearID: id, readOnly: deleted || store.readOnly, importing: $importingAttachments, loading: $loadingAttachments, preview: $attachmentPreview)
-            NativeReminderSection(gearID: id)
-            Section { Picker("内容", selection: $tab) { Text("历史").tag("history"); Text("活动").tag("activities") }.pickerStyle(.segmented) }
             if tab == "history" {
                 Section {
-                    NavigationLink {
-                        NativeGearTimeline(gearID: id)
-                    } label: {
-                        Label("时间线", systemImage: "clock.arrow.circlepath")
-                    }.accessibilityIdentifier("gear-timeline-open")
-                    if !deleted && !store.readOnly {
-                        HStack {
-                            Button("添加装配") { editor = .init(kind: "history", parent: id) }.buttonStyle(.borderless)
-                            Spacer()
-                            Button("添加记录") { editor = .init(kind: "event", parent: id) }.buttonStyle(.borderless)
-                        }
-                    }
                     ForEach(timeline, id: \.timelineID) { row in
-                        let subject = row["subjectGearId"].text
-                        VStack(alignment: .leading, spacing: 7) {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    if subject != id { NavigationLink { NativeGearDetail(id: subject) } label: { Text(row["subjectName"].text).font(.caption).foregroundStyle(.secondary) } }
-                                Text(describeGearRecord(row, name: store.name))
-                                }
-                                Spacer()
-                                if !deleted && !store.readOnly && store.gear(subject)["deletedAt"].isNull && !["purchase", "status"].contains(row["entryType"].text) {
-                                    Menu {
-                                        if row["entryType"].text == "event" {
-                                            Button("添加提醒", systemImage: "bell.badge") { editor = .init(kind: "reminder", item: ["eventID": row["id"]], parent: subject) }
-                                        }
-                                        Button("编辑") { editor = .init(kind: row["entryType"].text == "operation" ? "inventory" : row["entryType"].text == "event" ? "event" : "history", item: row, parent: row["entryType"].text == "operation" ? row["gearId"].text : subject) }
-                                        Button("删除", role: .destructive) {
-                                            pendingHistory = row
-                                            if row["entryType"].text == "operation" {
-                                                do { purge = try store.query("inventory-delete-preview", ["id": row["id"]]); confirmation = "inventory-delete" }
-                                                catch { store.error = error.userFacingMessage }
-                                            } else { confirmation = row["entryType"].text == "event" ? "event-delete" : "history-delete" }
-                                        }
-                                    } label: { Image(systemName: "ellipsis") }.accessibilityIdentifier("gear-history-menu-" + row.timelineID)
-                                }
-                            }
-                            Text(row["entryType"].text == "event" && !row["occurredTime"].isNull ? row["occurredDate"].text + " " + row["occurredTime"].text : String(row["at"].text.prefix(10))).font(.caption).foregroundStyle(.secondary)
-                            if row["entryType"].text == "event" {
-                                if !row["notes"].text.isEmpty { Text(row["notes"].text).font(.callout) }
-                                let metrics = store.view["eventStatistics"][row.id]
-                                Text("距今 \(metrics["days"].integer) 天 · \(nativeDistance(metrics["distance"]))").font(.caption).foregroundStyle(.secondary)
-                                NativePhotoStrip(owner: "event", ownerID: row.id)
-                            }
-                        }.padding(.vertical, 4).id(row.timelineID)
+                        renderHistoryRow(row).id(row.timelineID)
                     }
-                    if timeline.isEmpty { Text("暂无历史").foregroundStyle(.secondary) }
+                    if timeline.isEmpty {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("暂无历史记录").font(.subheadline).foregroundStyle(NativeAppearance.secondaryText)
+                            if !deleted && !store.readOnly {
+                                Button("添加记录", systemImage: "square.and.pencil") { editor = .init(kind: "event", parent: id) }
+                                    .font(.subheadline).accessibilityIdentifier("gear-history-empty-add")
+                            }
+                        }.padding(.vertical, 8)
+                    }
+                } header: {
+                    HStack {
+                        NavigationLink { NativeGearTimeline(gearID: id) } label: {
+                            Label("时间线", systemImage: "clock.arrow.circlepath").frame(minHeight: 44)
+                        }.accessibilityIdentifier("gear-timeline-open")
+                        Spacer()
+                        if !deleted && !store.readOnly {
+                            Menu {
+                                Button("添加装配", systemImage: "link") { editor = .init(kind: "history", parent: id) }
+                                Button("添加记录", systemImage: "square.and.pencil") { editor = .init(kind: "event", parent: id) }
+                                    .accessibilityIdentifier("gear-create-event")
+                            } label: { Image(systemName: "plus").frame(width: 44, height: 44).contentShape(Rectangle()) }
+                                .accessibilityLabel("添加历史记录").accessibilityIdentifier("gear-add-record")
+                        }
+                    }.font(.subheadline).textCase(nil).padding(.bottom, 2)
                 }
             } else {
                 Section {
-                    Button { rangeOpen = true } label: { Label(from.isEmpty && to.isEmpty ? "全部日期" : "\(from.isEmpty ? "最早" : from) – \(to.isEmpty ? "至今" : to)", systemImage: "calendar") }
-                    LabeledContent("期间距离", value: nativeDistance(usage["summary"]["distance"]))
-                    LabeledContent("期间时长", value: nativeDuration(usage["summary"]["seconds"]))
-                    LabeledContent("活动", value: "\(usage["summary"]["count"].integer) 次")
+                    Button { rangeOpen = true } label: {
+                        HStack(spacing: 12) {
+                            Label(from.isEmpty && to.isEmpty ? "全部日期" : "\(from.isEmpty ? "最早" : from) – \(to.isEmpty ? "至今" : to)", systemImage: "calendar")
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 0)
+                            Image(systemName: "chevron.down").font(.caption.weight(.semibold)).foregroundStyle(NativeAppearance.secondaryText)
+                        }
+                    }.accessibilityIdentifier("gear-activity-date-range")
+                    ViewThatFits(in: .horizontal) {
+                        HStack(alignment: .top, spacing: 14) {
+                            NativeMetric(title: "期间距离", value: nativeDistance(usage["summary"]["distance"]))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            NativeMetric(title: "期间时长", value: nativeDuration(usage["summary"]["seconds"]))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            NativeMetric(title: "活动", value: "\(usage["summary"]["count"].integer) 次")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }.fixedSize(horizontal: true, vertical: true)
+                        VStack(alignment: .leading, spacing: 12) {
+                            LabeledContent("期间距离", value: nativeDistance(usage["summary"]["distance"]))
+                            LabeledContent("期间时长", value: nativeDuration(usage["summary"]["seconds"]))
+                            LabeledContent("活动", value: "\(usage["summary"]["count"].integer) 次")
+                        }
+                    }.padding(.vertical, 6)
                 }
                 Section("活动记录") {
                     ForEach(usage["rows"].array, id: \.activityID) { row in
                         NavigationLink { NativeActivityDetail(id: row["activity"].id, usedGear: id) } label: { NativeActivityRow(activity: row["activity"], distance: row["distance"]) }
                     }
-                    if usage["rows"].array.isEmpty { Text(from.isEmpty && to.isEmpty ? "暂无使用记录" : "这段时间没有使用记录").foregroundStyle(.secondary) }
+                    if usage["rows"].array.isEmpty {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text(from.isEmpty && to.isEmpty ? "暂无使用记录" : "这段时间没有使用记录").foregroundStyle(NativeAppearance.secondaryText)
+                            if !from.isEmpty || !to.isEmpty {
+                                Button("查看全部日期") { from = ""; to = ""; loadUsage() }
+                                    .accessibilityIdentifier("gear-activity-clear-range")
+                            }
+                        }.padding(.vertical, 8)
+                    }
                 }
             }
+            NativeAttachmentSection(gearID: id, readOnly: deleted || store.readOnly, importing: $importingAttachments, loading: $loadingAttachments, preview: $attachmentPreview)
         }
         .task(id: timelineGeneration) {
             guard timelineGeneration >= 0, let focusedHistoryID,
@@ -120,6 +121,10 @@ struct NativeGearDetail: View {
             proxy.scrollTo(focusedHistoryID, anchor: .center)
         }
         }
+        .scrollContentBackground(.hidden)
+        .contentMargins(.top, 10, for: .scrollContent)
+        .background(NativeAppearance.canvas)
+        .listSectionSpacing(14)
         .navigationTitle(store.displayName(id)).navigationBarTitleDisplayMode(.inline)
         .toolbar {
             if !store.readOnly {
@@ -130,6 +135,11 @@ struct NativeGearDetail: View {
                             Button("永久删除", role: .destructive) { do { purge = try store.query("purge-preview", ["id": .string(id)]); confirmation = "purge" } catch let failure { store.error = failure.userFacingMessage } }
                         } else {
                             Button("编辑", systemImage: "pencil") { editor = .init(kind: "gear", item: gear) }
+                            NativeInventoryActions(gearID: id) {
+                                if $0 == "replace" { replacementParent = store.parent(id) }
+                                editor = .init(kind: "inventory", item: ["kind": .string($0)], parent: id)
+                            }
+                            Divider()
                             Button("复制装备", systemImage: "doc.on.doc") { editor = .init(kind: "gear-copy", item: gear) }.accessibilityIdentifier("gear-copy")
                             Button("添加提醒", systemImage: "bell.badge") { editor = .init(kind: "reminder", parent: id) }
                             Button("添加组件", systemImage: "plus") { editor = .init(kind: "component", parent: id) }.accessibilityIdentifier("gear-add-component")
@@ -145,10 +155,11 @@ struct NativeGearDetail: View {
         .fileImporter(isPresented: $importingAttachments, allowedContentTypes: [.pdf, .image], allowsMultipleSelection: true) { result in
             switch result {
             case .success(let urls):
+                let generation = store.imageImportGeneration
                 loadingAttachments = true
                 Task {
                     defer { loadingAttachments = false }
-                    do { for url in urls { try await store.addAttachment(from: url, gearID: id) } }
+                    do { for url in urls { try await store.addAttachment(from: url, gearID: id, expectedGeneration: generation) } }
                     catch { store.error = error.userFacingMessage }
                 }
             case .failure(let error): if (error as NSError).code != NSUserCancelledError { store.error = error.userFacingMessage }
@@ -176,6 +187,94 @@ struct NativeGearDetail: View {
         .task { loadTimeline(); loadUsage() }
         .onChange(of: tab) { _, _ in loadTimeline(); loadUsage() }
         .onChange(of: store.viewGeneration) { _, _ in loadTimeline(); loadUsage() }
+    }
+    private func renderHistoryRow(_ row: Value) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            if !dynamicTypeSize.isAccessibilitySize {
+                Image(systemName: readRecordSymbol(row))
+                    .font(.system(size: 14, weight: .medium)).foregroundStyle(NativeAppearance.accent)
+                    .frame(width: 32, height: 32)
+                    .background(NativeAppearance.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .padding(.top, 2).accessibilityHidden(true)
+            }
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .top, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text(readRecordDate(row)).font(.caption).foregroundStyle(NativeAppearance.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(describeGearRecord(row, name: store.name))
+                            .font(.body.weight(.medium)).fixedSize(horizontal: false, vertical: true)
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                    if canEditRecord(row) { renderRecordMenu(row).padding(.top, -8).padding(.trailing, -8) }
+                }
+                if row["entryType"].text == "event" {
+                    if !row["notes"].text.isEmpty {
+                        Text(row["notes"].text).font(.subheadline).foregroundStyle(NativeAppearance.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    let metrics = store.view["eventStatistics"][row.id]
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 8) {
+                            Text("距今 \(metrics["days"].integer) 天")
+                            Text("·").accessibilityHidden(true)
+                            Text(nativeDistance(metrics["distance"]))
+                        }.fixedSize(horizontal: true, vertical: true)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("距今 \(metrics["days"].integer) 天")
+                            Text(nativeDistance(metrics["distance"]))
+                        }
+                    }.font(.caption).foregroundStyle(NativeAppearance.secondaryText)
+                    NativePhotoStrip(owner: "event", ownerID: row.id)
+                }
+            }
+        }.padding(.vertical, 8)
+    }
+    private func renderRecordMenu(_ row: Value) -> some View {
+        let subject = row["subjectGearId"].text
+        return Menu {
+            if row["entryType"].text == "event" {
+                Button("添加提醒", systemImage: "bell.badge") { editor = .init(kind: "reminder", item: ["eventID": row["id"]], parent: subject) }
+            }
+            Button("编辑", systemImage: "pencil") {
+                editor = .init(kind: row["entryType"].text == "operation" ? "inventory" : row["entryType"].text == "event" ? "event" : "history", item: row, parent: row["entryType"].text == "operation" ? row["gearId"].text : subject)
+            }
+            Button("删除", systemImage: "trash", role: .destructive) {
+                pendingHistory = row
+                if row["entryType"].text == "operation" {
+                    do { purge = try store.query("inventory-delete-preview", ["id": row["id"]]); confirmation = "inventory-delete" }
+                    catch { store.error = error.userFacingMessage }
+                } else { confirmation = row["entryType"].text == "event" ? "event-delete" : "history-delete" }
+            }
+        } label: {
+            Image(systemName: "ellipsis").font(.body).foregroundStyle(NativeAppearance.accent)
+                .frame(width: 44, height: 44).contentShape(Rectangle())
+        }
+        .accessibilityLabel(readRecordDate(row) + "的" + describeGearRecord(row, name: store.name) + "，操作")
+        .accessibilityIdentifier("gear-history-menu-" + row.timelineID)
+    }
+    private func canEditRecord(_ row: Value) -> Bool {
+        !deleted && !store.readOnly && store.gear(row["subjectGearId"].text)["deletedAt"].isNull
+            && !["purchase", "status"].contains(row["entryType"].text)
+    }
+    private func readRecordDate(_ row: Value) -> String {
+        if row["entryType"].text == "event" && !row["occurredTime"].isNull { return row["occurredDate"].text + " " + row["occurredTime"].text }
+        if let date = NativeDate.parseInstant(row["instant"].text) { return NativeDate.format(date, "yyyy-MM-dd HH:mm XXXXX") }
+        return String(row["at"].text.prefix(10)) + (["installation", "operation"].contains(row["entryType"].text) ? " · 全天" : "")
+    }
+    private func readRecordSymbol(_ row: Value) -> String {
+        switch row["entryType"].text {
+        case "purchase": return "bag"
+        case "event": return "wrench.and.screwdriver"
+        case "status": return row["status"].text == "stock" ? "shippingbox" : row["status"].text == "retired" ? "archivebox" : "arrow.up.forward.app"
+        case "operation":
+            switch row["kind"].text {
+            case "replace": return "arrow.triangle.2.circlepath"
+            case "store": return "shippingbox"
+            case "activate": return "arrow.up.forward.app"
+            default: return "link"
+            }
+        default: return "link"
+        }
     }
     private var deletionTitle: String {
         switch confirmation {

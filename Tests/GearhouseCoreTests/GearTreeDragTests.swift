@@ -52,6 +52,32 @@ final class GearTreeDragTests: XCTestCase {
         XCTAssertThrowsError(try GearTreeDrag(gearIDs: ["wheel"]).staging(onto: "missing", originalParents: parents, pending: [:]))
         XCTAssertThrowsError(try GearTreeDrag(gearIDs: ["wheel","missing"]).staging(onto: "propel", originalParents: parents, pending: [:]))
     }
+    func testMergedPendingLimitRejectsNewChangeButAllowsEditingAndReverting() throws {
+        let ids = (0..<500).map { "gear-\($0)" }
+        var tree = Dictionary(uniqueKeysWithValues: ids.map { ($0, "original") })
+        for root in ["original", "first", "second"] { tree[root] = "" }
+        let pending = try GearTreeDrag(gearIDs: Array(ids.prefix(499))).staging(onto: "first", originalParents: tree, pending: [:])
+        XCTAssertEqual(pending.count, 499)
+
+        let overflow = try GearTreeDrag(gearIDs: [ids[499]])
+        XCTAssertThrowsError(try overflow.staging(onto: "first", originalParents: tree, pending: pending)) { error in
+            let message = "每次最多调整 499 件装备，请先保存或撤销部分修改。"
+            XCTAssertEqual((error as? DomainError)?.message, message)
+            XCTAssertEqual(UserFacingError.message(error), message)
+        }
+        XCTAssertEqual(pending, Dictionary(uniqueKeysWithValues: ids.prefix(499).map { ($0, "first") }))
+
+        let existing = try GearTreeDrag(gearIDs: [ids[0]])
+        let changed = try existing.staging(onto: "second", originalParents: tree, pending: pending)
+        XCTAssertEqual(changed.count, 499)
+        XCTAssertEqual(changed[ids[0]], "second")
+        let reduced = try existing.staging(onto: "original", originalParents: tree, pending: changed)
+        XCTAssertEqual(reduced.count, 498)
+        XCTAssertNil(reduced[ids[0]])
+        let resumed = try overflow.staging(onto: "first", originalParents: tree, pending: reduced)
+        XCTAssertEqual(resumed.count, 499)
+        XCTAssertEqual(resumed[ids[499]], "first")
+    }
     func testStagedBatchPublishesOneTimestampAndPreservesSavedActivityUsage() throws {
         let engine = try NativeDomain()
         var state = try engine.execute(state: .null, action: "initialize")["state"]

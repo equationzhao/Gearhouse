@@ -1,5 +1,29 @@
 import Foundation
 
+public struct GearActivityFilter: Equatable, Sendable {
+    public enum Assignment: String, CaseIterable, Sendable {
+        case all, unlinked, pending
+    }
+    public var type: String
+    public var assignment: Assignment
+
+    public init(type: String = "", assignment: Assignment = .all) {
+        self.type = type
+        self.assignment = assignment
+    }
+
+    public var isActive: Bool { !type.isEmpty || assignment != .all }
+
+    public func matchesActivity(_ activity: Value) -> Bool {
+        guard !activity["deleted"].flag, type.isEmpty || activity["type"].text == type else { return false }
+        switch assignment {
+        case .all: return true
+        case .unlinked: return activity["main"].text.isEmpty && !activity["remoteId"].text.isEmpty
+        case .pending: return activity["pending"].flag && activity["source"].text.uppercased() != "STRAVA"
+        }
+    }
+}
+
 /// Calendar dates are inclusive; the internal upper bound is the next midnight.
 public struct ActivityDateRange: Equatable, Sendable {
     public let start: Date

@@ -45,7 +45,16 @@ Do not put an API Key in source code or configuration files. Enter it inside the
 
 ## UI verification
 
-Equipment and drag UI tests launch with `-preview-route tree`. The preview library is stored separately, uses synthetic activity data, and does not load the saved Intervals.icu key.
+Use the iOS Simulator for UI development and verification. Use an isolated synthetic preview library; do not use a physical device or real user data unless explicitly requested. Equipment and drag UI tests launch with `-preview-route tree`. The preview library is stored separately and does not load the saved Intervals.icu key.
+
+Every UI change requires visual review before completion:
+
+1. Run the affected screens in the simulator and inspect screenshots of the actual rendered interface.
+2. Check the relevant light and dark appearances, images and missing images, large text, and key interactions. Include expanded trees, selection, and dragging when affected.
+3. Fix visible hierarchy, spacing, clipping, contrast, and interaction problems, then inspect the updated screens again.
+4. Record the screens and states reviewed, and keep local screenshots available for review.
+
+A successful build or automated test run does not count as visual acceptance.
 
 ```sh
 xcodebuild -project GearhouseApp.xcodeproj -scheme GearhouseApp \
@@ -53,7 +62,7 @@ xcodebuild -project GearhouseApp.xcodeproj -scheme GearhouseApp \
   -only-testing:GearhouseUITests/GearEquipmentUITests test
 ```
 
-Replace the simulator name with one listed by `xcrun simctl list devices available`. To use an unlocked, paired iPhone, use `-destination 'platform=iOS,id=YOUR_DEVICE_ID'` instead. A simulator needs normal local signing to exercise Keychain; do not disable signing for a UI test run.
+Replace the simulator name with one listed by `xcrun simctl list devices available`. A simulator needs normal local signing to exercise Keychain; do not disable signing for a UI test run.
 
 `GearBackupUITests` additionally requires choosing an iCloud Drive test folder through the system picker. Run it explicitly; it is not part of unattended CI.
 
@@ -64,3 +73,11 @@ The Debug self-tests (`-native-self-test`, `-backup-self-test`, `-reminder-self-
 The committed preview fixture is synthetic and contains no connected account. `node scripts/make-preview.mjs` regenerates it; generated IDs and timestamps can change. Tests must use synthetic fixtures or explicitly supplied local files. Optional migration comparisons use `GEARHOUSE_MIGRATION_SOURCE`, or the pair `GEARHOUSE_PARITY_SOURCE` / `GEARHOUSE_PARITY_EXPECTED`, and skip when those files are absent.
 
 `scripts/export-web-backup.py` converts an explicitly selected legacy local database to an import file. It does not need the old web source or server. Treat its output as private data.
+
+## 图标、数据迁移与通知排程
+
+图标源文件为 `GearhouseApp/GearhouseIcon.icon`，可用 Xcode 附带的 Icon Composer 打开。1024 × 1024 的链节 G 主体与链轴细节使用独立 SVG 图层；默认外观为暖白底、蓝色 G，深色外观为深蓝底、银白 G。Mono 使用白色主体与灰色链轴，由系统应用透明和着色外观。玻璃效果保留轮廓高光，关闭额外投影。
+
+项目资源阶段编译 `.icon` 文件，主图标名设为 `GearhouseIcon`。系统负责圆角遮罩和各场景尺寸，修改图层后重新构建。个人开发团队和 Bundle ID 可在 `Config/Local.xcconfig` 中设置。
+
+原生原型数据迁移到 `state-v2.json`；旧 `state.json` 保留。固定日期重复通知预排后续 12 轮，系统待发请求总数控制在 60 条以内，应用运行时补充；不能据此承诺长期关闭应用仍会持续补排。

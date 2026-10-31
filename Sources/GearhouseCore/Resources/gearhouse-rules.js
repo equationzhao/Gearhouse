@@ -4,19 +4,19 @@ const modules = Object.create(null), cache = Object.create(null);
 modules['node:crypto'] = () => ({randomUUID:()=>nativeUUID(),createHash:()=>{let value='';return {update(x){value+=String(x);return this;},digest(){return nativeHash(value);}};}});
 function require(id){ if(!cache[id]) cache[id]=modules[id](); return cache[id]; }
 modules["native-entry.js"] = function(){
-const {readGearStatuses,readInventoryConflict} = require("lib/gear-state.mjs");
+const {buildGearStateIndex,readGearStatuses,readInventoryConflict} = require("lib/gear-state.mjs");
 const {validateInventory,saveInventoryGear,readOperationOptions,previewGearOperation,applyGearOperation,previewOperationDeletion,deleteGearOperation,previewInventoryBatch,storeInventoryBatch} = require("lib/inventory.mjs");
 const {ensureCategories,saveCategory,deleteCategory} = require("lib/categories.mjs");
-const {empty,clone,ensure,nowLocal,installationDate,migrateInstallationDates,saveGear,deleteGear,restoreGear,batchMove,saveAssignment,importGear,mergeActivities,stats,treeValid} = require("lib/domain.mjs");
+const {empty,clone,ensure,nowLocal,installationDate,migrateInstallationDates,saveGear,deleteGear,restoreGear,batchMove,saveAssignment,importGear,mergeActivities,stats,treeValid,observeActivityGear,refreshRemoteGears,reconcileActivityMappings,activityInstant,activityTimeUncertain,shanghaiTime} = require("lib/domain.mjs");
 const {saveInstallation,deleteInstallation} = require("lib/history.mjs");
 const {previewOrganization,applyOrganization} = require("lib/organize.mjs");
-const {previewRecompute,applyRecompute} = require("lib/recompute.mjs");
+const {previewRecompute,applyRecompute,undoRecompute} = require("lib/recompute.mjs");
 const {previewPurge,purgeGear} = require("lib/purge.mjs");
-const {mutateGearEvent,eventMetrics} = require("lib/gear-events.mjs");
-const {addPhoto,editPhotos,attachEventPhotos,prunePhotos} = require("lib/photos.mjs");
+const {mutateGearEvent} = require("lib/gear-events.mjs");
+const {PHOTO_LIMIT,addPhoto,editPhotos,attachEventPhotos,prunePhotos} = require("lib/photos.mjs");
 const {createComponent} = require("lib/components.mjs");
 const {addAttachment,deleteAttachment} = require("lib/attachments.mjs");
-const {buildSnapshot} = require("public/snapshot.js");
+const {buildSnapshot,buildActivityIndex,calculateEventMetrics} = require("public/snapshot.js");
 const {gearActivityRows,filterUsageRange,summarizeUsage} = require("public/gear-activities.js");
 const {syncPlan,retryDelay} = require("lib/auto-sync.mjs");
 const {applyConfirmedDeletions} = require("lib/activity-deletions.mjs");
@@ -31,16 +31,18 @@ function normalized(raw){
   s.events=s.gears.filter(g=>g.parentID).map(g=>({id: nativeUUID(),gearId:g.id,parentId:g.parentID,at:'2000-01-01T00:00:00'}));
   s.activities=(raw.activities||[]).map(a=>({...a,at:(a.at||'').replace(/Z$/,'').slice(0,19),main:a.mainGearID||null,remoteId:a.remoteGearID||null,extras:[],excluded:[],snapshot:a.mainGearID?[{id:a.mainGearID,parentId:null,...(a.equipmentDistanceIncluded===false?{distanceIncluded:false}:{})}]:[],equipmentDistance:a.equipmentDistanceIncluded,manual:false}));
   // Prototype dates were absolute ISO instants; restore the canonical Shanghai wall clock.
-  s.activities.forEach((a,i)=>{const d=Date.parse(raw.activities[i].at);if(Number.isFinite(d))a.at=new Date(d+8*3600000).toISOString().slice(0,19);});
+  s.activities.forEach((a,i)=>{a.startInstant=activityInstant(raw.activities[i].at);if(a.startInstant)a.at=shanghaiTime(a.startInstant);});
   s.nativePrototypeMigration=true;return s;
  }
  ensure(Array.isArray(raw.gears)&&Array.isArray(raw.activities),'备份数据无效');
+ for(const a of raw.activities)if(a.startInstant!==undefined&&a.startInstant!==null)ensure(activityInstant(a.startInstant)===a.startInstant,'活动时间无效，请选择完整备份。');
  delete raw.configs;raw.gearEvents??=[];raw.photos??=[];raw.syncLog??=[];raw.remoteGears??=[];
  ensure(treeValid(raw,raw.events),'装配历史存在环路');return raw;
 }
 function view(s,date){
- if(date){const snapshot=buildSnapshot(s,date,nowLocal());return {...snapshot,gearStatuses:readGearStatuses(snapshot,snapshot.snapshotView.cutoff)};}
- return {...s,gearStatuses:readGearStatuses(s,nowLocal()),inventoryConflicts:s.activities.filter(a=>!a.deleted&&a.at&&readInventoryConflict(s,a)).map(a=>a.id),statistics:Object.fromEntries(s.gears.map(g=>[g.id,stats(s,g.id)])),eventStatistics:Object.fromEntries((s.gearEvents||[]).map(e=>[e.id,eventMetrics(s,e)]))};
+ if(date){const snapshot=buildSnapshot(s,date,nowLocal());return {...snapshot,gearStatuses:readGearStatuses(snapshot,snapshot.snapshotView.cutoff,buildGearStateIndex(snapshot))};}
+ const now=nowLocal(),activityIndex=buildActivityIndex(s),gearStateIndex=buildGearStateIndex(s);
+ return {...s,gearStatuses:readGearStatuses(s,now,gearStateIndex),inventoryConflicts:s.activities.filter(a=>!a.deleted&&a.at&&readInventoryConflict(s,a,gearStateIndex)).map(a=>a.id),statistics:Object.fromEntries(s.gears.map(g=>[g.id,stats(s,g.id,activityIndex)])),eventStatistics:Object.fromEntries((s.gearEvents||[]).map(e=>[e.id,calculateEventMetrics(s,e,now,activityIndex)]))};
 }
 function call(serialized){
  try{
@@ -50,9 +52,10 @@ function call(serialized){
    case 'initialize':migrateInstallationDates(s);break;
    case 'view':return JSON.stringify({result:view(s,input.date)});
    case 'usage':{const rows=filterUsageRange(gearActivityRows(input.date?buildSnapshot(s,input.date,nowLocal()):s,input.id),input);return JSON.stringify({result:{rows,summary:summarizeUsage(rows)}});}
+   case 'activity-statuses':{const a=s.activities.find(a=>a.id===input.id);ensure(a,'活动不存在');return JSON.stringify({result:{uncertain:activityTimeUncertain(s,a),statuses:readGearStatuses(s,a.at,undefined,a.startInstant)}});}
    case 'category-save':result=saveCategory(s,input);break;
    case 'category-delete':result=deleteCategory(s,input);break;
-   case 'gear':result=saveInventoryGear(s,input);break;
+   case 'gear':result=saveInventoryGear(s,input);reconcileActivityMappings(s);break;
    case 'inventory-options':result=readOperationOptions(s,input);mutate=false;break;
    case 'inventory-preview':result=previewGearOperation(s,input);mutate=false;break;
    case 'inventory-batch-preview':result=previewInventoryBatch(s,input);mutate=false;break;
@@ -69,23 +72,36 @@ function call(serialized){
    case 'delete':result=deleteGear(s,input.id);break;
    case 'restore':result=restoreGear(s,input.id);break;
    case 'hidden':{const g=s.gears.find(g=>g.id===input.id&&!g.deletedAt);ensure(g,'装备不存在');g.hidden=!!input.hidden;break;}
-   case 'moves':batchMove(s,input.changes,input.at);result={ok:true};break;
+   case 'moves':batchMove(s,input.changes,input.at,input.instant);result={ok:true};break;
    case 'history-save':result=saveInstallation(s,input);break;
    case 'history-delete':result=deleteInstallation(s,input);break;
    case 'organize-preview':result=previewOrganization(s,input.changes);mutate=false;break;
    case 'organize':result=applyOrganization(s,input.changes);break;
    case 'recompute-preview':result=previewRecompute(s,input);mutate=false;break;
    case 'recompute':{const p=previewRecompute(s,input);ensure(!p.totals.some(t=>t.baselineDisabled)||input.baselineConfirmed,'请确认停用 ICU 历史基数');result=applyRecompute(s,input);break;}
+   case 'recompute-undo':result=undoRecompute(s,input.id);break;
    case 'purge-preview':result=previewPurge(s,input.id);mutate=false;break;
    case 'purge':result=purgeGear(s,input);break;
    case 'event-save':result=mutateGearEvent(s,'save',input);attachEventPhotos(s,result.id,input.event);break;
    case 'event-delete':result=mutateGearEvent(s,'delete',input);break;
    case 'photo-add':result=addPhoto(s,input,input.metadata);break;
+   case 'photo-add-batch':{
+    ensure(Array.isArray(input.records)&&input.records.length>0,'请选择有效的图片');
+    ensure(input.records.length<=PHOTO_LIMIT,'最多添加 40 张图片');
+    result=input.records.map(record=>addPhoto(s,record,record.metadata));break;
+   }
    case 'photo-edit':result=editPhotos(s,input);break;
    case 'attachment-add':result=addAttachment(s,input);break;
    case 'attachment-delete':result=deleteAttachment(s,input);break;
    case 'assignment-preview':result=saveAssignment(s,input.id,input.assignment);mutate=false;break;
    case 'assignment':result=saveAssignment(s,input.id,input.assignment);break;
+   case 'assignment-observe':result=observeActivityGear(s,input);break;
+   case 'assignment-rebase':{
+    const a=s.activities.find(a=>a.id===input.id);ensure(a&&a.pending,'活动已有后续修改');
+    ensure((a.remoteId||null)===(input.remoteId||null),'ICU 主装备已变化，请重新选择。');
+    a.mainSyncBase=a.remoteId||null;a.mainConflict=false;delete a.mainResolutionRequired;break;
+   }
+   case 'gear-refresh':result=refreshRemoteGears(s,input.rows);break;
    case 'account':ensure(input.id,'账户无效');ensure(!s.account||s.account.id===input.id,'此数据库属于其他 ICU 账户');s.account=input;break;
    case 'gear-import':{
     result=importGear(s,input.rows);
@@ -118,7 +134,7 @@ function call(serialized){
     s.syncLog.unshift({...s.lastSync,...result});s.syncLog=s.syncLog.slice(0,1000);
     if(input.saveResume!==false)s.autoSync={...(s.autoSync||{}),resume:{next:input.next}};break;
    }
-   case 'write-result':{const a=s.activities.find(a=>a.id===input.id);ensure(a,'活动不存在');if(input.error)a.error=input.error;else {ensure((a.main||null)===(input.main||null),'活动已有后续修改');a.remoteId=input.target;a.pending=false;a.error=null;a.lastWriteAt=new Date().toISOString();}break;}
+   case 'write-result':{const a=s.activities.find(a=>a.id===input.id);ensure(a,'活动不存在');ensure(!input.editId||a.mainEditId===input.editId,'活动已有后续修改');if(input.error)a.error=input.error;else {ensure((a.main||null)===(input.main||null),'活动已有后续修改');a.remoteId=input.target;a.mainSyncBase=input.target;a.pending=false;a.mainConflict=false;delete a.mainResolutionRequired;a.error=null;a.lastWriteAt=new Date().toISOString();}break;}
    default:throw Error('未知操作');
   }
   if(mutate){prunePhotos(s);s.revision=(s.revision||0)+1;}
@@ -129,60 +145,92 @@ function call(serialized){
 return {call};
 };
 modules["lib/gear-state.mjs"] = function(){
+const {compareTimeline,appliesAt} = require("lib/timeline-time.mjs");
+// This index belongs to one unchanged view input; never reuse after mutation.
+function buildGearStateIndex(s){
+ const gears=new Map(),events=new Map(),states=new Map();
+ for(const gear of s.gears)if(!gears.has(gear.id))gears.set(gear.id,gear);
+ for(const row of s.events){if(!events.has(row.gearId))events.set(row.gearId,[]);events.get(row.gearId).push(row);}
+ for(const row of s.gearStates||[]){if(!states.has(row.gearId))states.set(row.gearId,[]);states.get(row.gearId).push(row);}
+ return {gears,events,states};
+}
 // Read dated equipment status without changing saved activity membership.
-function readOwnGearStatus(s,id,at,includeUndatedRetirement=true){
- const gear=s.gears.find(g=>g.id===id);
- const row=(s.gearStates||[]).filter(e=>e.gearId===id&&e.at<=at).sort((a,b)=>a.at.localeCompare(b.at)).at(-1);
+function readOwnGearStatus(s,id,at,includeUndatedRetirement=true,index,instant){
+ const gear=index?index.gears.get(id):s.gears.find(g=>g.id===id);
+ const row=(index?index.states.get(id)||[]:s.gearStates||[]).filter(e=>e.gearId===id&&appliesAt(e,at,instant)).sort(compareTimeline).at(-1);
  if(row)return row.status;
  return gear?.retired&&(gear.retiredAt?gear.retiredAt<=at:includeUndatedRetirement)?'retired':'active';
 }
-function readGearStatus(s,id,at,includeUndatedRetirement=true){
+function readGearStatus(s,id,at,includeUndatedRetirement=true,index,instant){
  const seen=new Set();let current=id,status='active';
  while(current&&!seen.has(current)){
-  seen.add(current);status=readOwnGearStatus(s,current,at,includeUndatedRetirement);
+  seen.add(current);status=readOwnGearStatus(s,current,at,includeUndatedRetirement,index,instant);
   if(status==='retired')return status;
-  const parent=s.events.filter(e=>e.gearId===current&&e.at<=at).sort((a,b)=>a.at.localeCompare(b.at)).at(-1)?.parentId;
+  const parent=(index?index.events.get(current)||[]:s.events).filter(e=>e.gearId===current&&appliesAt(e,at,instant)).sort(compareTimeline).at(-1)?.parentId;
   if(!parent)return status;
   current=parent;
  }
  return status;
 }
-function readGearStatuses(s,at){return Object.fromEntries(s.gears.map(g=>[g.id,readGearStatus(s,g.id,at)]));}
-function readInventoryConflict(s,activity){
- return [activity.main,...(activity.extras||[])].filter(Boolean).some(id=>readGearStatus(s,id,activity.at,false)!=='active');
+function readGearStatuses(s,at,index,instant){return Object.fromEntries(s.gears.map(g=>[g.id,readGearStatus(s,g.id,at,true,index,instant)]));}
+function readInventoryConflict(s,activity,index){
+ if(activity.assemblyTimeUnknown)return false;
+ return [activity.main,...(activity.extras||[])].filter(Boolean).some(id=>readGearStatus(s,id,activity.at,false,index,activity.startInstant)!=='active');
 }
 
-return {readOwnGearStatus,readGearStatus,readGearStatuses,readInventoryConflict};
+return {buildGearStateIndex,readOwnGearStatus,readGearStatus,readGearStatuses,readInventoryConflict};
+};
+modules["lib/timeline-time.mjs"] = function(){
+// Date-only records remain effective from their recorded civil day. Precise
+// records carry UTC so repeated wall-clock hours can be ordered correctly.
+function compareTimeline(a,b){
+ if(a.instant&&b.instant)return a.instant.localeCompare(b.instant);
+ const day=a.at.slice(0,10).localeCompare(b.at.slice(0,10));
+ if(day)return day;
+ if(a.at===b.at&&a.at.endsWith('T00:00:00'))return 0;
+ if(!a.instant&&b.instant)return a.allDay||a.at.endsWith('T00:00:00')?-1:(a.at.localeCompare(b.at)||-1);
+ if(a.instant&&!b.instant)return b.allDay||b.at.endsWith('T00:00:00')?1:(a.at.localeCompare(b.at)||1);
+ return a.at.localeCompare(b.at);
+}
+function appliesAt(row,at,instant){
+ if(row.instant&&instant)return row.instant<=instant;
+ return row.at<=at;
+}
+
+return {compareTimeline,appliesAt};
 };
 modules["lib/inventory.mjs"] = function(){
-const {clone,ensure,uid,nowLocal,installationDate,parentAt,saveGear,batchMove,treeValid,expand} = require("lib/domain.mjs");
+const {clone,ensure,uid,nowLocal,installationDate,installationTime,parentAt,saveGear,batchMove,treeValid,expand,activityTimeUncertain,shanghaiTime,buildTimedAssemblyIndex} = require("lib/domain.mjs");
 const {readGearStatus,readOwnGearStatus,readGearStatuses} = require("lib/gear-state.mjs");
+const {compareTimeline} = require("lib/timeline-time.mjs");
 
 const conflictMessage='该日期已有更换或库存记录，请编辑原记录。';
 const laterMessage='已有后续装配或库存记录，请先处理后续记录。';
 function findGear(s,id){const gear=s.gears.find(g=>g.id===id&&!g.deletedAt);ensure(gear,'装备不存在或已删除');return gear;}
 function readCategory(gear){return gear.categoryId||gear.type;}
-function readChildren(s,id,at){return s.gears.filter(g=>!g.deletedAt&&parentAt(s,g.id,at)===id);}
-function readDescendants(s,ids,at){
+function readChildren(s,id,at,instant){return s.gears.filter(g=>!g.deletedAt&&parentAt(s,g.id,at,instant)===id);}
+function readDescendants(s,ids,at,instant){
  const result=new Set(ids);let count;
- do{count=result.size;for(const gear of s.gears)if(result.has(parentAt(s,gear.id,at)))result.add(gear.id);}while(count!==result.size);
+ do{count=result.size;for(const gear of s.gears)if(result.has(parentAt(s,gear.id,at,instant)))result.add(gear.id);}while(count!==result.size);
  return result;
 }
-function ensureUnchangedFuture(s,ids,at){
- ensure(!s.events.some(e=>e.at>at&&(ids.has(e.gearId)||ids.has(e.parentId)))&&!(s.gearStates||[]).some(e=>e.at>at&&ids.has(e.gearId)),laterMessage);
+function ensureUnchangedFuture(s,ids,time){
+ ensure(!s.events.some(e=>compareTimeline(e,time)>0&&(ids.has(e.gearId)||ids.has(e.parentId)))&&!(s.gearStates||[]).some(e=>compareTimeline(e,time)>0&&ids.has(e.gearId)),laterMessage);
 }
-function writeStatus(s,id,status,at,operationId){
+function writeStatus(s,id,status,at,operationId,instant){
  s.gearStates??=[];
- const previous=s.gearStates.find(e=>e.gearId===id&&e.at===at);
+ const matches=e=>instant?e.instant===instant:e.at===at&&!e.instant;
+ const previous=s.gearStates.find(e=>e.gearId===id&&matches(e));
  ensure(!previous?.operationId||previous.operationId===operationId,conflictMessage);
- s.gearStates=s.gearStates.filter(e=>!(e.gearId===id&&e.at===at));
- s.gearStates.push({id:previous?.id||uid(),gearId:id,status,at,...(operationId?{operationId}:{})});
+ s.gearStates=s.gearStates.filter(e=>!(e.gearId===id&&matches(e)));
+ s.gearStates.push({id:previous?.id||uid(),gearId:id,status,at,...(instant?{instant,allDay:false}:{}),...(operationId?{operationId}:{})});
 }
 function serializeRows(rows){return JSON.stringify(rows.slice().sort((a,b)=>a.id.localeCompare(b.id)).map(row=>Object.fromEntries(Object.entries(row).sort(([a],[b])=>a.localeCompare(b)))));}
-function readAffectedActivities(s,next,from){
+function readAffectedActivities(s,next,from,fromInstant,timeIndex){
  return s.activities.filter(a=>{
-  if(a.deleted||a.summary||a.unavailable||!a.at||a.at<from)return false;
-  const before=expand(s,[a.main,...(a.extras||[])],a.at,a.excluded||[]),after=expand(next,[a.main,...(a.extras||[])],a.at,a.excluded||[]);
+  if(a.deleted||a.summary||a.unavailable||!a.at||activityTimeUncertain(next,a,timeIndex))return false;
+  if(fromInstant&&a.startInstant?a.startInstant<fromInstant:a.at<from)return false;
+  const before=expand(s,[a.main,...(a.extras||[])],a.at,a.excluded||[],{instant:a.startInstant}),after=expand(next,[a.main,...(a.extras||[])],a.at,a.excluded||[],{instant:a.startInstant});
   const changed=new Set([...before.filter(row=>!after.some(other=>other.id===row.id&&other.parentId===row.parentId)),...after.filter(row=>!before.some(other=>other.id===row.id&&other.parentId===row.parentId))].map(row=>row.id));
   if(!changed.size)return false;
   const saved=(a.snapshot||[]).filter(row=>changed.has(row.id)).map(({id,parentId})=>({id,parentId:parentId||null}));
@@ -192,8 +240,8 @@ function readAffectedActivities(s,next,from){
 function removeOperation(s,id){
  const operation=(s.gearOperations||[]).find(op=>op.id===id);ensure(operation,'更换或库存记录已不存在，请重新打开。');
  for(const gearID of operation.gearIds)findGear(s,gearID);
- const ids=readDescendants(s,operation.gearIds,operation.at);
- ensureUnchangedFuture(s,ids,operation.at);
+ const ids=readDescendants(s,operation.gearIds,operation.at,operation.instant);
+ ensureUnchangedFuture(s,ids,operation);
  for(const [field,before,after] of [['events','beforeEvents','afterEvents'],['gearStates','beforeStates','afterStates']]){
   const actual=(s[field]||[]).filter(e=>e.operationId===id);
   ensure(serializeRows(actual)===serializeRows(operation[after]),'相关记录已修改，请重新打开后检查。');
@@ -207,16 +255,27 @@ function prepareState(s,input){const next=clone(s);if(input.operationId)removeOp
 function validateInventory(s){
  for(const field of ['gearStates','gearOperations'])ensure(s[field]===undefined||Array.isArray(s[field]),'库存记录不完整，请选择完整备份。');
  const ids=new Set(),days=new Set(),known=new Set(s.gears.map(g=>g.id));
+ const eventPoints=new Set(),dayPoints=new Set(s.events.filter(row=>!row.instant).map(row=>row.gearId+':'+row.at));
+ for(const row of s.events){
+  ensure(row.allDay!==false||!!row.instant,'装配记录缺少生效时刻，请选择完整备份。');
+  if(!row.instant)continue;
+  const time=installationTime(row.at,row.instant,{allowFuture:true});
+  const key=row.gearId+':'+row.instant;
+  ensure(row.allDay===false&&time.at===row.at&&time.instant===row.instant&&!eventPoints.has(key)&&!dayPoints.has(row.gearId+':'+row.at),'装配记录不完整，请选择完整备份。');
+  eventPoints.add(key);
+ }
  for(const row of s.gearStates||[]){
   ensure(row.id&&known.has(row.gearId)&&!ids.has(row.id)&&['active','stock','retired'].includes(row.status),'库存记录不完整，请选择完整备份。');
-  ensure(installationDate(row.at)===row.at&&!days.has(row.gearId+row.at),'库存记录不完整，请选择完整备份。');
-  ids.add(row.id);days.add(row.gearId+row.at);
+  const time=installationTime(row.at,row.instant,{allowFuture:true});
+  ensure(time.at===row.at&&(row.instant?row.instant===time.instant&&row.allDay===false:row.allDay!==false)&&!days.has(row.gearId+(row.instant||row.at)),'库存记录不完整，请选择完整备份。');
+  ids.add(row.id);days.add(row.gearId+(row.instant||row.at));
  }
  const operations=new Set();
  for(const op of s.gearOperations||[]){
   ensure(op.id&&!operations.has(op.id)&&['replace','store','activate','install'].includes(op.kind)&&known.has(op.gearId)&&Array.isArray(op.gearIds)&&op.gearIds.every(id=>known.has(id)),'库存记录不完整，请选择完整备份。');
   ensure(['beforeEvents','afterEvents','beforeStates','afterStates'].every(field=>Array.isArray(op[field])),'库存记录不完整，请选择完整备份。');
-  ensure(installationDate(op.at)===op.at,'库存记录不完整，请选择完整备份。');
+  const time=installationTime(op.at,op.instant,{allowFuture:true});ensure(time.at===op.at&&(op.instant?op.instant===time.instant&&op.allDay===false:op.allDay!==false),'库存记录不完整，请选择完整备份。');
+  ensure([...op.afterEvents,...op.afterStates].every(e=>e.at===op.at&&(e.instant||null)===(op.instant||null)),'库存记录时间不一致，请选择完整备份。');
   ensure(serializeRows(s.events.filter(e=>e.operationId===op.id))===serializeRows(op.afterEvents)&&serializeRows((s.gearStates||[]).filter(e=>e.operationId===op.id))===serializeRows(op.afterStates),'库存记录不完整，请选择完整备份。');
   ensure([...op.beforeEvents,...op.afterEvents].every(e=>known.has(e.gearId)&&(!e.parentId||known.has(e.parentId)))&&[...op.beforeStates,...op.afterStates].every(e=>known.has(e.gearId)&&['active','stock','retired'].includes(e.status)),'库存记录不完整，请选择完整备份。');
   operations.add(op.id);
@@ -236,23 +295,26 @@ function saveInventoryGear(s,input){
  Object.assign(s,next);return gear;
 }
 function readOperationOptions(s,input){
- const next=prepareState(s,input),at=installationDate(input.at||nowLocal()),gear=findGear(next,input.gearId);
- const descendants=readDescendants(next,[gear.id],at);
- const candidates=next.gears.filter(g=>g.id!==gear.id&&!g.deletedAt&&!descendants.has(g.id)&&readCategory(g)===readCategory(gear)&&readGearStatus(next,g.id,at)==='stock');
- const ancestors=new Set();let current=parentAt(next,gear.id,at);while(current&&!ancestors.has(current)){ancestors.add(current);current=parentAt(next,current,at);}
- const parents=next.gears.filter(g=>!g.deletedAt&&!descendants.has(g.id)&&readGearStatus(next,g.id,at)!=='retired');
- return {revision:s.revision,gear,parentId:parentAt(next,gear.id,at),status:readGearStatus(next,gear.id,at),candidates:candidates.filter(g=>!ancestors.has(g.id)),parents,children:readChildren(next,gear.id,at),statuses:readGearStatuses(next,at)};
+ const next=prepareState(s,input),time=installationTime(input.at||nowLocal(),input.instant),at=time.at,instant=time.instant,gear=findGear(next,input.gearId);
+ const descendants=readDescendants(next,[gear.id],at,instant);
+ const status=id=>readGearStatus(next,id,at,true,undefined,instant);
+ const candidates=next.gears.filter(g=>g.id!==gear.id&&!g.deletedAt&&!descendants.has(g.id)&&readCategory(g)===readCategory(gear)&&status(g.id)==='stock');
+ const ancestors=new Set();let current=parentAt(next,gear.id,at,instant);while(current&&!ancestors.has(current)){ancestors.add(current);current=parentAt(next,current,at,instant);}
+ const parents=next.gears.filter(g=>!g.deletedAt&&!descendants.has(g.id)&&status(g.id)!=='retired');
+ return {revision:s.revision,gear,parentId:parentAt(next,gear.id,at,instant),status:status(gear.id),candidates:candidates.filter(g=>!ancestors.has(g.id)),parents,children:readChildren(next,gear.id,at,instant),statuses:Object.fromEntries(next.gears.map(g=>[g.id,status(g.id)])),parentsByID:Object.fromEntries(next.gears.map(g=>[g.id,parentAt(next,g.id,at,instant)]))};
 }
 function planOperation(s,input){
- const next=prepareState(s,input),at=installationDate(input.at||nowLocal());ensure(at<=nowLocal(),'不能设置未来的装配时间');
+ const next=prepareState(s,input),time=installationTime(input.at||nowLocal(),input.instant),at=time.at,instant=time.instant;ensure(instant||at<=nowLocal(),'不能设置未来的装配时间');
  const previous=(s.gearOperations||[]).find(op=>op.id===input.operationId);
- const recomputeFrom=previous&&previous.at<at?previous.at:at;
+ const previousFirst=previous&&compareTimeline(previous,time)<0;
+ const recomputeFrom=previousFirst?previous.at:at,recomputeInstant=previousFirst?previous.instant:instant;
  const gear=findGear(next,input.gearId),kind=input.kind;ensure(['replace','store','activate','install'].includes(kind),'请选择装备操作。');
  const operationId=input.operationId||uid(),changes=[],statuses=[],gearIds=new Set([gear.id]);
- let replacement=null,parentId=parentAt(next,gear.id,at),created=false;
+ const status=id=>readGearStatus(next,id,at,true,undefined,instant);
+ let replacement=null,parentId=parentAt(next,gear.id,at,instant),created=false;
  if(kind==='replace'){
   ensure(parentId,'该装备在所选日期未装配，请选择其他日期。');
-  ensure(readGearStatus(next,gear.id,at)!=='retired','请先恢复使用，再更换装备。');
+  ensure(status(gear.id)!=='retired','请先恢复使用，再更换装备。');
   if(input.newGear){
    ensure(!input.newGear.id,'请创建新装备');
    ensure(!input.newGear.categoryId||input.newGear.categoryId===readCategory(gear),'只能更换同一类别的装备。');
@@ -262,42 +324,47 @@ function planOperation(s,input){
    writeStatus(next,replacement.id,'stock',installationDate(replacement.purchased||at));created=true;
   }else replacement=findGear(next,input.replacementId);
   ensure(replacement.id!==gear.id&&readCategory(replacement)===readCategory(gear),'只能更换同一类别的装备。');
-  ensure(readGearStatus(next,replacement.id,at)==='stock','所选装备不在库存，请重新选择。');
+  ensure(status(replacement.id)==='stock','所选装备不在库存，请重新选择。');
   ensure(!replacement.purchased||replacement.purchased.slice(0,10)<=at.slice(0,10),'装配日期不能早于新件的购买日期。');
-  let ancestor=gear.id;const seen=new Set();while(ancestor&&!seen.has(ancestor)){ensure(ancestor!==replacement.id,'不能使用自身或上级装备进行更换。');seen.add(ancestor);ancestor=parentAt(next,ancestor,at);}
-  ensure(!readDescendants(next,[gear.id],at).has(replacement.id),'不能使用自身或组件进行更换。');
+  let ancestor=gear.id;const seen=new Set();while(ancestor&&!seen.has(ancestor)){ensure(ancestor!==replacement.id,'不能使用自身或上级装备进行更换。');seen.add(ancestor);ancestor=parentAt(next,ancestor,at,instant);}
+  ensure(!readDescendants(next,[gear.id],at,instant).has(replacement.id),'不能使用自身或组件进行更换。');
   const destination=input.destination||'stock';ensure(['stock','retired'].includes(destination),'请选择旧件去向。');
   changes.push({gearId:gear.id,parentId:null},{gearId:replacement.id,parentId});
   statuses.push([gear.id,destination],[replacement.id,'active']);gearIds.add(replacement.id);
-  const children=readChildren(next,gear.id,at),selected=[...new Set(input.childIds||[])];
+  const children=readChildren(next,gear.id,at,instant),selected=[...new Set(input.childIds||[])];
   ensure(selected.every(id=>children.some(g=>g.id===id)),'所选组件已改变，请重新选择。');
   for(const id of selected){changes.push({gearId:id,parentId:replacement.id});gearIds.add(id);}
  }else if(kind==='store'){
-  ensure(readGearStatus(next,gear.id,at)!=='retired','请先恢复使用，再放入库存。');
-  ensure(readGearStatus(next,gear.id,at)!=='stock'||parentId,'该装备已在库存。');
+  ensure(status(gear.id)!=='retired','请先恢复使用，再放入库存。');
+  ensure(status(gear.id)!=='stock'||parentId,'该装备已在库存。');
   if(parentId)changes.push({gearId:gear.id,parentId:null});statuses.push([gear.id,'stock']);
  }else if(kind==='activate'){
   if(parentId)changes.push({gearId:gear.id,parentId:null});statuses.push([gear.id,'active']);
  }else{
-  ensure(readGearStatus(next,gear.id,at)==='stock','所选装备不在库存，请重新选择。');
-  const target=findGear(next,input.parentId);ensure(readGearStatus(next,target.id,at)!=='retired','请先恢复所属装备。');
+  ensure(status(gear.id)==='stock','所选装备不在库存，请重新选择。');
+  const target=findGear(next,input.parentId);ensure(status(target.id)!=='retired','请先恢复所属装备。');
   parentId=target.id;changes.push({gearId:gear.id,parentId});statuses.push([gear.id,'active']);
  }
- const affected=readDescendants(next,[...gearIds],at);
- ensureUnchangedFuture(next,affected,at);
+ const affected=readDescendants(next,[...gearIds],at,instant);
+ ensureUnchangedFuture(next,affected,time);
+ const samePoint=e=>instant?e.instant===instant:e.at===at&&!e.instant;
  for(const id of gearIds){
-  ensure(!next.events.some(e=>e.gearId===id&&e.at===at&&e.operationId)&&!(next.gearStates||[]).some(e=>e.gearId===id&&e.at===at&&e.operationId),conflictMessage);
+  ensure(!instant||!(next.gearStates||[]).some(e=>e.gearId===id&&samePoint(e)),'该时刻已有库存记录，请编辑原记录。');
+  ensure(!instant||!(next.gearStates||[]).some(e=>e.gearId===id&&!e.instant&&e.at===at),'该时刻已有库存记录，请编辑原记录。');
+  ensure(!next.events.some(e=>e.gearId===id&&samePoint(e)&&e.operationId)&&!(next.gearStates||[]).some(e=>e.gearId===id&&samePoint(e)&&e.operationId),conflictMessage);
  }
  const moved=new Set(changes.map(c=>c.gearId)),stateIds=new Set(statuses.map(([id])=>id));
- const beforeEvents=clone(next.events.filter(e=>moved.has(e.gearId)&&e.at===at));
- const beforeStates=clone((next.gearStates||[]).filter(e=>stateIds.has(e.gearId)&&e.at===at));
- if(changes.length){batchMove(next,changes,at);for(const event of next.events)if(moved.has(event.gearId)&&event.at===at)event.operationId=operationId;}
- for(const [id,status] of statuses)writeStatus(next,id,status,at,operationId);
- const operation={id:operationId,kind,gearId:gear.id,gearIds:[...gearIds],at,parentId,replacementId:replacement?.id||null,destination:input.destination||'stock',childIds:input.childIds||[],created,
+ const beforeEvents=clone(next.events.filter(e=>moved.has(e.gearId)&&samePoint(e)));
+ const beforeStates=clone((next.gearStates||[]).filter(e=>stateIds.has(e.gearId)&&samePoint(e)));
+ if(changes.length){batchMove(next,changes,at,instant);for(const event of next.events)if(moved.has(event.gearId)&&samePoint(event))event.operationId=operationId;}
+ for(const [id,nextStatus] of statuses)writeStatus(next,id,nextStatus,at,operationId,instant);
+ const operation={id:operationId,kind,gearId:gear.id,gearIds:[...gearIds],...time,parentId,replacementId:replacement?.id||null,destination:input.destination||'stock',childIds:input.childIds||[],created,
   beforeEvents,beforeStates,afterEvents:clone(next.events.filter(e=>e.operationId===operationId)),afterStates:clone((next.gearStates||[]).filter(e=>e.operationId===operationId))};
  (next.gearOperations??=[]).push(operation);
- const affectedActivities=readAffectedActivities(s,next,recomputeFrom);
- const preview={...operation,revision:s.revision,affectedActivities:affectedActivities.length,sameDayActivities:s.activities.filter(a=>!a.deleted&&a.at?.slice(0,10)===at.slice(0,10)&&a.snapshot?.some(row=>affected.has(row.id)||row.id===parentId)).length,newName:replacement?.name||null,oldName:gear.name,parentName:next.gears.find(g=>g.id===parentId)?.name||null,transferred:changes.filter(c=>c.gearId!==gear.id&&c.gearId!==replacement?.id).map(c=>({id:c.gearId,name:findGear(next,c.gearId).name})),recomputeGearId:parentId||gear.id,recomputeFrom,recomputeGearIds:[...new Set([parentId||gear.id,...(previous?[previous.parentId||previous.gearId]:[])])]};
+ const timeIndex=buildTimedAssemblyIndex(next),affectedActivities=readAffectedActivities(s,next,recomputeFrom,recomputeInstant,timeIndex);
+ const timeUnknownActivities=s.activities.filter(a=>!a.deleted&&!a.summary&&!a.unavailable&&activityTimeUncertain(next,a,timeIndex)).length;
+ const previewFrom=recomputeInstant?new Date(Date.parse(recomputeFrom.slice(0,10)+'T00:00:00Z')-2*86400000).toISOString().slice(0,10):recomputeFrom;
+ const preview={...operation,revision:s.revision,affectedActivities:affectedActivities.length,timeUnknownActivities,sameDayActivities:s.activities.filter(a=>!a.deleted&&(instant&&a.startInstant?shanghaiTime(a.startInstant):a.at)?.slice(0,10)===at.slice(0,10)&&a.snapshot?.some(row=>affected.has(row.id)||row.id===parentId)).length,newName:replacement?.name||null,oldName:gear.name,parentName:next.gears.find(g=>g.id===parentId)?.name||null,transferred:changes.filter(c=>c.gearId!==gear.id&&c.gearId!==replacement?.id).map(c=>({id:c.gearId,name:findGear(next,c.gearId).name})),recomputeGearId:parentId||gear.id,recomputeFrom:previewFrom,recomputeGearIds:[...new Set([parentId||gear.id,...(previous?[previous.parentId||previous.gearId]:[])])]};
  return {next,preview};
 }
 function previewGearOperation(s,input){return planOperation(s,input).preview;}
@@ -306,7 +373,8 @@ function previewOperationDeletion(s,input){const next=clone(s),operation=removeO
 function deleteGearOperation(s,input){ensure(input.confirmed,'请确认删除记录');const next=clone(s),operation=removeOperation(next,input.id);Object.assign(s,next);return operation;}
 
 function planInventoryBatch(s,input){
- ensure(Array.isArray(input.gearIds)&&input.gearIds.length>0&&input.gearIds.length<500,'请选择要移动的装备。');
+ ensure(Array.isArray(input.gearIds)&&input.gearIds.length>0,'请选择要移动的装备。');
+ ensure(input.gearIds.length<500,'每次最多调整 499 件装备，请减少选择后重试。');
  const at=installationDate(input.at||nowLocal()),chosen=new Set(input.gearIds);
  const roots=[...chosen].filter(id=>{let parent=parentAt(s,id,at),seen=new Set();while(parent&&!seen.has(parent)){if(chosen.has(parent))return false;seen.add(parent);parent=parentAt(s,parent,at);}return true;});
  let next=clone(s);const rows=[];
@@ -323,17 +391,52 @@ modules["lib/domain.mjs"] = function(){
 const {randomUUID} = require("node:crypto");
 const {ensureCategories} = require("lib/categories.mjs");
 const {readGearStatus,readOwnGearStatus} = require("lib/gear-state.mjs");
+const {compareTimeline,appliesAt} = require("lib/timeline-time.mjs");
 const uid=()=>randomUUID();
 const clone=x=>structuredClone(x);
 const empty=()=>ensureCategories({version:1,revision:0,account:null,gears:[],events:[],gearEvents:[],activities:[],remoteGears:[],gearImported:false,lastSync:null,syncLog:[]});
 function ensure(ok,message){if(!ok){const e=new Error(message);e.status=400;throw e;}}
 function dateTime(value){ensure(typeof value==='string'&&/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(value)&&Number.isFinite(Date.parse(value+'Z')),'时间格式无效');const full=value.length===16?value+':00':value;ensure(new Date(full+'Z').toISOString().slice(0,19)===full,'时间格式无效');return full;}
+// An ICU local clock alone cannot distinguish time zones or repeated DST hours.
+function activityInstant(value){
+ if(typeof value!=='string')return null;
+ const match=/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+ if(!match)return null;
+ try{dateTime(match[1]);}catch{return null;}
+ if(match[2]!=='Z'){const h=Number(match[2].slice(1,3)),m=Number(match[2].slice(4,6));if(h>14||m>59||(h===14&&m!==0))return null;}
+ const parsed=Date.parse(value);return Number.isFinite(parsed)?new Date(parsed).toISOString():null;
+}
 function installationDate(value){
  ensure(typeof value==='string','日期无效');
  return dateTime(value.length===10?value+'T00:00:00':value).slice(0,10)+'T00:00:00';
 }
+function shanghaiTime(instant){return new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(new Date(instant)).replace(' ','T');}
+function installationTime(value,instant,{allowFuture=false}={}){
+ if(instant===undefined||instant===null)return {at:installationDate(value),allDay:true};
+ const utc=activityInstant(instant);ensure(utc,'请选择有效的生效时间');
+ const at=shanghaiTime(utc);
+ ensure(typeof value==='string'&&value.slice(0,10)===at.slice(0,10),'生效日期与时间不一致');
+ ensure(allowFuture||Date.parse(utc)<=Date.now(),'不能设置未来的装配时间');
+ return {at,instant:utc,allDay:false};
+}
+function buildTimedAssemblyIndex(s){
+ const parents=new Map();function find(id){if(!parents.has(id))parents.set(id,id);let p=id;while(parents.get(p)!==p)p=parents.get(p);while(id!==p){const next=parents.get(id);parents.set(id,p);id=next;}return p;}
+ for(const row of s.events)if(row.gearId&&row.parentId){const a=find(row.gearId),b=find(row.parentId);if(a!==b)parents.set(a,b);}
+ const days=new Map();for(const row of [...s.events,...(s.gearStates||[])])if(row.instant&&row.gearId){const root=find(row.gearId),list=days.get(root)||[];list.push(Date.parse(row.at.slice(0,10)+'T00:00:00Z'));days.set(root,list);}
+ return {find,days};
+}
+function hasTimedAssembly(s,a,index=buildTimedAssemblyIndex(s)){
+ return [a.main,...(a.extras||[])].filter(Boolean).some(id=>index.days.has(index.find(id)));
+}
+function activityTimeUncertain(s,a,index=buildTimedAssemblyIndex(s)){
+ if(a.startInstant||!a.at)return false;
+ const day=Date.parse(a.at.slice(0,10)+'T00:00:00Z');
+ if(!Number.isFinite(day))return true;
+ return [a.main,...(a.extras||[])].filter(Boolean).some(id=>(index.days.get(index.find(id))||[]).some(value=>Math.abs(value-day)<=2*86400000));
+}
 function migrateInstallationDates(s){
  if(s.installationDatesVersion===1)return;
+ ensure(!s.events.some(e=>e.instant),'装配记录缺少时间版本，请选择完整备份。');
  const byDay=new Map(),aliases=new Map();let changed=0;
  for(const e of s.events.slice().sort((a,b)=>a.at.localeCompare(b.at))){
   const at=installationDate(e.at),key=e.gearId+':'+at,previous=byDay.get(key);
@@ -351,17 +454,17 @@ function migrateInstallationDates(s){
 }
 function today(){return new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Shanghai'}).format(new Date());}
 function nowLocal(){return new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(new Date()).replace(' ','T');}
-function parentAt(s,id,at){return s.events.filter(e=>e.gearId===id&&e.at<=at).sort((a,b)=>a.at.localeCompare(b.at)).at(-1)?.parentId||null;}
+function parentAt(s,id,at,instant){return s.events.filter(e=>e.gearId===id&&appliesAt(e,at,instant)).sort(compareTimeline).at(-1)?.parentId||null;}
 // Cache only an exact structural signature; imported data cannot assert trust.
 let treeValidation;
 function treeValid(s,events){
- const signature=JSON.stringify([s.gears.map(g=>g.id),events.map(e=>[e.gearId,e.parentId,e.at])]);
+ const signature=JSON.stringify([s.gears.map(g=>g.id),events.map(e=>[e.gearId,e.parentId,e.at,e.instant])]);
  if(treeValidation?.signature===signature)return treeValidation.valid;
- const ordered=events.slice().sort((a,b)=>a.at.localeCompare(b.at)),parents=new Map();
+ const ordered=events.slice().sort(compareTimeline),parents=new Map();
  let valid=true;
  for(let i=0;i<ordered.length&&valid;){
-  const at=ordered[i].at;
-  do{const e=ordered[i++];parents.set(e.gearId,e.parentId||null);}while(i<ordered.length&&ordered[i].at===at);
+  const point=ordered[i];
+  do{const e=ordered[i++];parents.set(e.gearId,e.parentId||null);}while(i<ordered.length&&compareTimeline(ordered[i],point)===0);
   // Apply all events at the same instant before checking the resulting graph.
   const complete=new Set();
   for(const g of s.gears){
@@ -376,19 +479,21 @@ function treeValid(s,events){
  }
  treeValidation={signature,valid};return valid;
 }
-function batchMove(s,changes,at){at=installationDate(at);ensure(at<=nowLocal(),'不能设置未来的装配时间');ensure(Array.isArray(changes)&&changes.length>0&&changes.length<500,'没有可保存的修改');const ids=new Set();for(const c of changes){ensure(s.gears.some(g=>g.id===c.gearId&&!g.deletedAt),'装备不存在或已删除');ensure(!ids.has(c.gearId),'装备重复');ids.add(c.gearId);ensure(c.parentId===null||s.gears.some(g=>g.id===c.parentId&&!g.deletedAt),'所属装备不存在或已删除');}
-ensure(!(s.gearOperations||[]).some(op=>op.at>=at&&op.gearIds.some(id=>ids.has(id))),'请通过更换或库存记录修改这次装配。');
-ensure(!s.events.some(e=>ids.has(e.gearId)&&e.at.slice(0,10)===at.slice(0,10)&&e.operationId),'该日期已有更换或库存记录，请编辑原记录。');
-const rootStatuses=new Map(changes.map(c=>[c.gearId,c.parentId===null&&readGearStatus(s,c.gearId,at)==='stock'?'stock':'active']));
-const events=s.events.filter(e=>!(ids.has(e.gearId)&&e.at.slice(0,10)===at.slice(0,10))).concat(changes.map(c=>{const old=s.events.find(e=>e.gearId===c.gearId&&e.at.slice(0,10)===at.slice(0,10));return {id:old?.id||uid(),gearId:c.gearId,parentId:c.parentId,at,allDay:true};}));ensure(treeValid(s,events),'所属装备不能是自身或子装备（含后续历史关系）');s.events=events;for(const c of changes)activateMovedGear(s,c.gearId,at,events.find(e=>e.gearId===c.gearId&&e.at===at)?.id,rootStatuses.get(c.gearId));return s;}
-function activateMovedGear(s,id,at,installationId,status='active'){
- const before=readOwnGearStatus(s,id,at);if(before===status||before==='retired')return;
- const existing=(s.gearStates||[]).find(e=>e.gearId===id&&e.at===at);
+function batchMove(s,changes,value,instant){const time=installationTime(value,instant),at=time.at;ensure(time.instant||at<=nowLocal(),'不能设置未来的装配时间');ensure(Array.isArray(changes)&&changes.length>0,'没有可保存的修改');ensure(changes.length<500,'每次最多调整 499 件装备，请减少选择后重试。');const ids=new Set();for(const c of changes){ensure(s.gears.some(g=>g.id===c.gearId&&!g.deletedAt),'装备不存在或已删除');ensure(!ids.has(c.gearId),'装备重复');ids.add(c.gearId);ensure(c.parentId===null||s.gears.some(g=>g.id===c.parentId&&!g.deletedAt),'所属装备不存在或已删除');}
+const sameDay=e=>e.at.slice(0,10)===at.slice(0,10),samePoint=e=>time.instant?e.instant===time.instant:!e.instant&&sameDay(e);
+ensure(!(s.gearOperations||[]).some(op=>compareTimeline(op,time)>=0&&op.gearIds.some(id=>ids.has(id))),'请通过更换或库存记录修改这次装配。');
+ensure(!time.instant||!s.events.some(e=>ids.has(e.gearId)&&samePoint(e)),'该时刻已有装配记录，请编辑原记录。');
+ensure(!s.events.some(e=>ids.has(e.gearId)&&sameDay(e)&&(e.operationId&&(time.allDay||samePoint(e))||time.allDay&&e.instant||time.instant&&!e.instant&&e.at===at)),'该日期已有更换或库存记录，请编辑原记录。');
+const rootStatuses=new Map(changes.map(c=>[c.gearId,c.parentId===null&&readGearStatus(s,c.gearId,at,true,undefined,time.instant)==='stock'?'stock':'active']));
+const events=s.events.filter(e=>!(ids.has(e.gearId)&&samePoint(e))).concat(changes.map(c=>{const old=s.events.find(e=>e.gearId===c.gearId&&samePoint(e));return {id:old?.id||uid(),gearId:c.gearId,parentId:c.parentId,...time};}));ensure(treeValid(s,events),'所属装备不能是自身或子装备（含后续历史关系）');s.events=events;for(const c of changes)activateMovedGear(s,c.gearId,at,events.find(e=>e.gearId===c.gearId&&samePoint(e))?.id,rootStatuses.get(c.gearId),time.instant);return s;}
+function activateMovedGear(s,id,at,installationId,status='active',instant){
+ const before=readOwnGearStatus(s,id,at,true,undefined,instant);if(before===status||before==='retired')return;
+ const existing=(s.gearStates||[]).find(e=>e.gearId===id&&(instant?e.instant===instant:e.at===at&&!e.instant));
  ensure(!existing?.operationId,'该日期已有更换或库存记录，请编辑原记录。');
- s.gearStates=(s.gearStates||[]).filter(e=>!(e.gearId===id&&e.at===at));
- s.gearStates.push({id:existing?.id||uid(),gearId:id,status,at,installationId});
+ s.gearStates=(s.gearStates||[]).filter(e=>!(e.gearId===id&&(instant?e.instant===instant:e.at===at&&!e.instant)));
+ s.gearStates.push({id:existing?.id||uid(),gearId:id,status,at,installationId,...(instant?{instant,allDay:false}:{})});
 }
-function expand(s,roots,at,excluded=[],{allowInactiveRoots=false}={}){const result=[],seen=new Set(),ex=new Set(excluded);function visit(id,via){if(!id||seen.has(id)||ex.has(id))return;const g=s.gears.find(x=>x.id===id);if(!g||(g.deletedAt&&at>=g.deletedAt)||readGearStatus(s,id,at,false)!=='active'&&!(allowInactiveRoots&&via===null))return;seen.add(id);result.push({id,parentId:via});s.gears.filter(x=>parentAt(s,x.id,at)===id).forEach(x=>visit(x.id,id));}roots.forEach(id=>visit(id,null));return result;}
+function expand(s,roots,at,excluded=[],{allowInactiveRoots=false,instant=null}={}){const result=[],seen=new Set(),ex=new Set(excluded);function visit(id,via){if(!id||seen.has(id)||ex.has(id))return;const g=s.gears.find(x=>x.id===id);if(!g||(g.deletedAt&&at>=g.deletedAt)||readGearStatus(s,id,at,false,undefined,instant)!=='active'&&!(allowInactiveRoots&&via===null))return;seen.add(id);result.push({id,parentId:via});s.gears.filter(x=>parentAt(s,x.id,at,instant)===id).forEach(x=>visit(x.id,id));}roots.forEach(id=>visit(id,null));return result;}
 function equipmentDistanceIncluded(s,a,rows=[]){
  const used=new Set([a.main,...(a.extras||[]),...rows.map(x=>x.id)]);
  return a.type!=='VirtualRide'&&a.trainer!==true&&!s.gears.some(g=>g.type==='Trainer'&&used.has(g.id));
@@ -427,18 +532,101 @@ function saveGear(s,input){const existing=s.gears.find(g=>g.id===input.id);ensur
 const categoryId=input.categoryId||(input.type&&input.type!==existing?.type?requestedType:existing?.categoryId||requestedType);
 const category=s.gearCategories.find(c=>c.id===categoryId);ensure(category,'请选择装备类别。');
 const type=category.baseType;let remoteId=input.remoteId||null;
-if(remoteId){const r=s.remoteGears.find(x=>x.id===remoteId&&!x.component);ensure(r&&['Bike','Shoes'].includes(r.type),'请选择可关联的 Bike / Shoes');ensure(type===r.type,'装备类型与远端类型不一致');ensure(!s.gears.some(g=>g.id!==input.id&&g.remoteId===remoteId),'该 ICU 装备已关联其他本地装备');}
+if(remoteId){const r=s.remoteGears.find(x=>x.id===remoteId&&!x.component);const retained=existing?.remoteId===remoteId&&existing.type===type;ensure(retained||r&&['Bike','Shoes'].includes(r.type),'请选择可关联的 Bike / Shoes');ensure(retained||type===r.type,'装备类型与远端类型不一致');ensure(!s.gears.some(g=>g.id!==input.id&&g.remoteId===remoteId),'该 ICU 装备已关联其他本地装备');}
 const purchased=purchaseDate(input.purchased===undefined?(existing?.purchased||null):input.purchased);
 const g={id:existing?.id||uid(),name,type,categoryId,remoteId,purchased,notes:String(input.notes||'').slice(0,3000),createdAt:existing?.createdAt||nowLocal(),retired:!!input.retired};if(input.condition!==undefined){ensure(['','unused','used'].includes(input.condition),'请选择装备状况。');g.condition=input.condition;}if(existing)Object.assign(existing,g);else s.gears.push(g);return g;}
-function saveAssignment(s,id,input){const a=s.activities.find(x=>x.id===id);ensure(a&&!a.summary&&!a.unavailable&&!a.deleted,'活动不可编辑，请先读取完整数据');const main=input.main||null;ensure(main===null||s.gears.some(g=>g.id===main&&(!g.deletedAt||a.main===main)&&['Bike','Shoes'].includes(g.type)),'主装备必须是 Bike / Shoes');const extras=[...new Set(input.extras||[])];ensure(extras.every(x=>s.gears.some(g=>g.id===x&&(!g.deletedAt||(a.extras||[]).includes(x)))),'附加装备无效');const excluded=[...new Set(input.excluded||[])];ensure(excluded.every(x=>s.gears.some(g=>g.id===x))&&!excluded.includes(main),'排除装备无效');
-for(const selected of [main,...extras].filter(Boolean))ensure(readGearStatus(s,selected,a.at)==='active'||a.snapshot?.some(row=>row.id===selected),'该装备在活动当天未使用，请先调整使用日期。');
-const same=sameUsage(a,{main,extras,excluded});let snapshot=same&&!input.rebuild&&!input.refreshAssembly?a.snapshot:expand(s,[main,...extras],a.at,excluded);
-if(input.rebuild){a.equipmentDistance=equipmentDistanceIncluded(s,{...a,main,extras},snapshot);snapshot=distanceSnapshot(snapshot,a.equipmentDistance,s);}
-else if(!same||input.refreshAssembly)snapshot=preserveDistanceSnapshot(snapshot,a);
-Object.assign(a,{main,extras,excluded,snapshot,manual:true,unknown:false,error:null});a.pending=(s.gears.find(g=>g.id===main)?.remoteId||null)!==(a.remoteId||null);if(main&&!s.gears.find(g=>g.id===main)?.remoteId)a.pending=true;return a;}
-function sameUsage(a,b){return a.main===b.main&&JSON.stringify(a.extras||[])===JSON.stringify(b.extras)&&JSON.stringify(a.excluded||[])===JSON.stringify(b.excluded);}
+function readAssignmentOverrides(a){
+ // Old saves cannot tell us which field was edited. Keep their ownership and
+ // frozen assembly until the rider explicitly resumes following ICU.
+ return a.assignmentOverrides?{...a.assignmentOverrides}:a.manual?{main:'legacy',assembly:true}:{};
+}
+function mapRemoteMain(s,a){return a.remoteId?s.gears.find(g=>g.remoteId===a.remoteId&&['Bike','Shoes'].includes(g.type)&&(!g.deletedAt||a.at<g.deletedAt))?.id||null:null;}
+function replaceAssignmentRoots(s,a,main,extras){
+ const roots=[main,...extras].filter(Boolean),oldRoots=[a.main,...(a.extras||[])].filter(Boolean);
+ const timeUnknown=activityTimeUncertain(s,{...a,main,extras});
+ const removed=new Set(oldRoots.filter(id=>!roots.includes(id)));let count;
+ do{count=removed.size;for(const row of a.snapshot||[])if(removed.has(row.parentId)&&!roots.includes(row.id))removed.add(row.id);}while(count!==removed.size);
+ const rows=(a.snapshot||[]).filter(row=>!removed.has(row.id));
+ for(const id of roots.filter(id=>!oldRoots.includes(id))){
+  const expanded=timeUnknown?[{id,parentId:null}]:expand(s,[id],a.at,a.excluded||[],{allowInactiveRoots:true,instant:a.startInstant});
+  for(const row of preserveDistanceSnapshot(expanded,a))if(!rows.some(x=>x.id===row.id))rows.push(row);
+ }
+ const present=new Set(rows.map(row=>row.id));
+ return rows.map(row=>row.parentId&&!present.has(row.parentId)?{...row,parentId:null}:row);
+}
+function updateAssignmentSync(s,a){
+ const overrides=readAssignmentOverrides(a),target=s.gears.find(g=>g.id===a.main)?.remoteId||null;
+ a.pending=!!overrides.main&&(!!a.main&&!target||target!==(a.remoteId||null));
+ if(overrides.main&&overrides.main!=='legacy'&&!a.pending){a.mainSyncBase=a.remoteId||null;delete a.mainResolutionRequired;}
+ // Legacy edits have no recorded base. They require an explicit choice before
+ // a retry can overwrite a different remote value.
+ const base=Object.hasOwn(a,'mainSyncBase')?a.mainSyncBase:a.remoteId||null;
+ a.mainConflict=!!a.pending&&(a.mainResolutionRequired||overrides.main==='legacy'||base!==(a.remoteId||null)&&target!==(a.remoteId||null));
+}
+function reconcileActivityMappings(s){
+ for(const a of s.activities){
+  if(a.summary||a.unavailable||a.deleted)continue;
+  if(!readAssignmentOverrides(a).main){
+   const mapped=mapRemoteMain(s,a);
+   if((a.main||null)!==mapped){a.snapshot=replaceAssignmentRoots(s,a,mapped,a.extras||[]);a.main=mapped;if(activityTimeUncertain(s,a))a.assemblyTimeUnknown=true;}
+   a.unknown=!!a.remoteId&&!mapped;
+  }
+  updateAssignmentSync(s,a);
+ }
+}
+function saveAssignment(s,id,input){
+ const a=s.activities.find(x=>x.id===id);ensure(a&&!a.summary&&!a.unavailable&&!a.deleted,'活动不可编辑，请先读取完整数据');
+ const overrides=readAssignmentOverrides(a),changesMain=Object.hasOwn(input,'main')||input.followRemote===true;
+ let main=changesMain?(input.followRemote?mapRemoteMain(s,a):input.main||null):a.main||null;
+ ensure(main===null||s.gears.some(g=>g.id===main&&(!g.deletedAt||a.main===main)&&['Bike','Shoes'].includes(g.type)),'主装备必须是 Bike / Shoes');
+ let extras=[...new Set(Object.hasOwn(input,'extras')?input.extras||[]:a.extras||[])];
+ if(Object.hasOwn(input,'extras')){overrides.shoe=true;overrides.trainer=true;}
+ for(const [field,type] of [['shoe','CyclingShoes'],['trainer','Trainer']])if(Object.hasOwn(input,field)){
+  const selected=input[field]||null;
+  ensure(!selected||s.gears.some(g=>g.id===selected&&g.type===type&&(!g.deletedAt||(a.extras||[]).includes(g.id))),'附加装备无效');
+  extras=extras.filter(id=>s.gears.find(g=>g.id===id)?.type!==type);if(selected)extras.push(selected);
+  overrides[field]=true;
+ }
+ ensure(extras.every(id=>s.gears.some(g=>g.id===id&&(!g.deletedAt||(a.extras||[]).includes(id)))),'附加装备无效');
+ const excluded=Object.hasOwn(input,'excluded')?[...new Set(input.excluded||[])]:a.excluded||[];
+ ensure(excluded.every(id=>s.gears.some(g=>g.id===id))&&!excluded.includes(main),'排除装备无效');
+ const oldRoots=[a.main,...(a.extras||[])];
+ const timeUnknown=activityTimeUncertain(s,{...a,main,extras});
+ for(const selected of [main,...extras].filter(Boolean))if(!oldRoots.includes(selected)&&!input.followRemote){ensure(!timeUnknown,'活动缺少可靠的开始时刻，请先同步完整活动。');ensure(readGearStatus(s,selected,a.at,true,undefined,a.startInstant)==='active','该装备在活动当天未使用，请先调整使用日期。');}
+ ensure(!timeUnknown||(!input.rebuild&&!input.refreshAssembly),'活动缺少可靠的开始时刻，请先同步完整活动。');
+ let snapshot=input.rebuild||input.refreshAssembly?expand(s,[main,...extras],a.at,excluded,{instant:a.startInstant}):replaceAssignmentRoots(s,{...a,excluded},main,extras);
+ if(input.rebuild){a.equipmentDistance=equipmentDistanceIncluded(s,{...a,main,extras},snapshot);snapshot=distanceSnapshot(snapshot,a.equipmentDistance,s);overrides.assembly=true;}
+ else if(input.refreshAssembly)snapshot=preserveDistanceSnapshot(snapshot,a);
+ if(changesMain){
+  if(input.followRemote){delete overrides.main;delete overrides.assembly;delete a.mainSyncBase;delete a.mainEditId;delete a.mainResolutionRequired;}
+  else {
+   // Preserve the original comparison base through retries and ordinary reads.
+   if(!overrides.main||!a.pending)a.mainSyncBase=a.remoteId||null;
+   overrides.main=true;a.mainEditId=uid();
+  }
+  a.error=null;
+ }
+ const unresolved=timeUnknown||!!a.assemblyTimeUnknown&&!input.rebuild&&!input.refreshAssembly;
+ Object.assign(a,{main,extras,excluded,snapshot,assignmentOverrides:overrides,manual:Object.keys(overrides).length>0,assemblyTimeUnknown:unresolved});
+ a.unknown=!overrides.main&&!!a.remoteId&&!main;updateAssignmentSync(s,a);return a;
+}
+function observeActivityGear(s,input){
+ const a=s.activities.find(x=>x.id===input.id);ensure(a,'活动不存在');
+ ensure(!input.editId||a.mainEditId===input.editId,'活动已有后续修改');
+ a.remoteId=input.remoteId||null;a.remoteGearName=input.name||null;
+ if(typeof input.source==='string')a.source=input.source;
+ if(input.requireResolution)a.mainResolutionRequired=true;
+ updateAssignmentSync(s,a);return a;
+}
+function refreshRemoteGears(s,gears){
+ ensure(Array.isArray(gears)&&gears.every(g=>g&&g.id&&typeof g.name==='string'&&typeof g.type==='string'),'ICU Gear 返回格式无效');
+ ensure(new Set(gears.map(g=>String(g.id))).size===gears.length,'ICU Gear 返回格式无效');
+ s.remoteGears=gears.map(g=>({id:String(g.id),name:g.name||String(g.id),type:g.type,component:!!g.component,component_ids:g.component_ids||[]}));
+ return {count:s.remoteGears.length};
+}
 function importGear(s,gears,{at=nowLocal()}={}){
 ensure(Array.isArray(gears),'ICU Gear 返回格式无效');
+refreshRemoteGears(s,gears);
 if(s.gearImportVersion>=3)return {added:0,relations:0};
 at=dateTime(at);
 const first=!s.gearImported,filtered=gears.filter(g=>g&&g.id);
@@ -456,8 +644,6 @@ const parents=new Map();
 for(const g of filtered){const parent=lookup(g.id);if(!parent)continue;for(const id of g.component_ids||[]){const child=lookup(id);if(!child||!imported.has(child.id)||s.events.some(e=>e.gearId===child.id))continue;const choices=parents.get(child.id)||new Set();choices.add(parent.id);parents.set(child.id,choices);}}
 let relations=0;
 for(const [gearId,choices] of parents){if(choices.size!==1)continue;const event={id:uid(),gearId,parentId:[...choices][0],at:installationDate(at),allDay:true};if(treeValid(s,[...s.events,event])){s.events.push(event);relations++;}}
-// Keep the one-time source catalog separate from primary Gear writeback mappings.
-s.remoteGears=filtered.map(g=>({id:String(g.id),name:g.name||String(g.id),type:g.type||'Equipment',component:!!g.component,component_ids:g.component_ids||[]}));
 for(const g of filtered){
  const local=lookup(g.id);
  if(!g.component||!local||local.importedTotals)continue;
@@ -467,33 +653,39 @@ for(const g of filtered){
 s.gearImported=true;s.gearImportVersion=3;
 return {added:imported.size,relations};
 }
-function mergeActivities(s,rows,{historical=false}={}){ensure(Array.isArray(rows),'ICU 活动返回格式无效');let added=0,updated=0,unavailable=0;for(const r of rows){if(!r||!r.id)continue;let a=s.activities.find(x=>x.id===String(r.id));const stub=!r.start_date_local||!r.type;if(stub){unavailable++;if(a){a.unavailable=true;continue;}s.activities.push({id:String(r.id),name:r.name||'受限活动',at:r.start_date_local||'',type:r.type||'',distance:null,seconds:null,main:null,remoteId:null,snapshot:[],extras:[],excluded:[],unavailable:true});continue;}
-const hasGear=Object.hasOwn(r,'gear');const remoteId=hasGear?(r.gear?.id?String(r.gear.id):null):(a?.remoteId||null);const complete={id:String(r.id),name:r.name||r.type,at:r.start_date_local,type:r.type,distance:Number.isFinite(r.distance)?r.distance:null,seconds:Number.isFinite(r.moving_time)?r.moving_time:(r.elapsed_time??null),source:r.source||'',...(typeof r.trainer==='boolean'?{trainer:r.trainer}:{}),remoteId,summary:false,unavailable:false,deleted:false};
+function mergeActivities(s,rows,{historical=false}={}){ensure(Array.isArray(rows),'ICU 活动返回格式无效');const timeIndex=buildTimedAssemblyIndex(s);let added=0,updated=0,unavailable=0;for(const r of rows){if(!r||!r.id)continue;let a=s.activities.find(x=>x.id===String(r.id));const stub=!r.start_date_local||!r.type;if(stub){unavailable++;if(a){a.unavailable=true;continue;}s.activities.push({id:String(r.id),name:r.name||'受限活动',at:r.start_date_local||'',type:r.type||'',distance:null,seconds:null,main:null,remoteId:null,snapshot:[],extras:[],excluded:[],unavailable:true});continue;}
+const hasGear=Object.hasOwn(r,'gear');const remoteId=hasGear?(r.gear?.id?String(r.gear.id):null):(a?.remoteId||null);
+const startInstant=Object.hasOwn(r,'start_date')?activityInstant(r.start_date):(a?.at===r.start_date_local?a?.startInstant||null:null);
+const complete={id:String(r.id),name:r.name||r.type,at:r.start_date_local,startInstant,type:r.type,distance:Number.isFinite(r.distance)?r.distance:null,seconds:Number.isFinite(r.moving_time)?r.moving_time:(r.elapsed_time??null),source:r.source||'',...(typeof r.trainer==='boolean'?{trainer:r.trainer}:{}),remoteId,summary:false,unavailable:false,deleted:false};
 if(a&&!a.summary){
+ const previousInstant=a.startInstant||null,previousAt=a.at;
  Object.assign(a,complete);delete a.remoteDeletedAt;
- if(!a.manual&&hasGear){
+ if((previousInstant!==startInstant||previousAt!==complete.at)&&hasTimedAssembly(s,a,timeIndex))a.assemblyTimeUnknown=true;
+ if(!readAssignmentOverrides(a).main&&hasGear){
   const mapped=remoteId?s.gears.find(g=>g.remoteId===remoteId&&['Bike','Shoes'].includes(g.type)&&(!g.deletedAt||a.at<g.deletedAt))?.id||null:null;
   // Compare local ownership too: older syncs already refreshed remoteId without
   // following the Gear change, and a missing mapping may be added later.
   if((a.main||null)!==mapped){
-   const snapshot=expand(s,[mapped,...(a.extras||[])],a.at,a.excluded||[],{allowInactiveRoots:true});
-   a.snapshot=preserveDistanceSnapshot(snapshot,a);a.main=mapped;
+   a.snapshot=replaceAssignmentRoots(s,a,mapped,a.extras||[]);a.main=mapped;if(activityTimeUncertain(s,a))a.assemblyTimeUnknown=true;
    a.unknown=!!remoteId&&!mapped;a.error=null;
   }
  }
- a.pending=a.manual&&((a.main&&!s.gears.find(g=>g.id===a.main)?.remoteId)||((s.gears.find(g=>g.id===a.main)?.remoteId||null)!==remoteId));updated++;continue;}
-const main=remoteId?s.gears.find(g=>g.remoteId===remoteId)?.id||null:null;
-const assignment={main,extras:[],excluded:[],manual:false,pending:false,error:null,unknown:historical,snapshot:historical?(main?[{id:main,parentId:null}]:[]):expand(s,[main],complete.at,[],{allowInactiveRoots:true})};
+ if(hasGear){a.remoteGearName=r.gear?.name||null;if(!readAssignmentOverrides(a).main)a.unknown=!!remoteId&&!a.main;}
+ updateAssignmentSync(s,a);updated++;continue;}
+const main=mapRemoteMain(s,complete);
+const timeUnknown=activityTimeUncertain(s,{...complete,main},timeIndex);
+const assignment={main,extras:[],excluded:[],manual:false,assignmentOverrides:{},pending:false,mainConflict:false,error:null,unknown:!!remoteId&&!main,assemblyTimeUnknown:timeUnknown,remoteGearName:r.gear?.name||null,snapshot:historical&&!hasTimedAssembly(s,{...complete,main},timeIndex)||timeUnknown?(main?[{id:main,parentId:null}]:[]):expand(s,[main],complete.at,[],{allowInactiveRoots:true,instant:complete.startInstant})};
 const next={...complete,...assignment};next.equipmentDistance=equipmentDistanceIncluded(s,next,next.snapshot);next.snapshot=distanceSnapshot(next.snapshot,next.equipmentDistance,s);if(a)Object.assign(a,next);else{s.activities.push(next);added++;}}
 return {added,updated,unavailable};}
-function stats(s,id){
+function stats(s,id,activityIndex){
 const gear=s.gears.find(g=>g.id===id);
 const baseline=gear?.totalsMode==='local'?null:gear?.importedTotals;
-const activities=s.activities.filter(a=>!a.deleted&&!a.summary&&!a.unavailable&&(!baseline||a.at>baseline.through)&&a.snapshot?.some(x=>x.id===id));
+const source=activityIndex?activityIndex.byGear.get(id)||[]:s.activities;
+const activities=source.filter(a=>!a.deleted&&!a.summary&&!a.unavailable&&(!baseline||a.at>baseline.through)&&a.snapshot?.some(x=>x.id===id));
 return {count:(baseline?.count||0)+activities.length,distance:activities.reduce((v,a)=>v+(a.snapshot.find(x=>x.id===id).distanceIncluded===false?0:(a.distance||0)),baseline?.distance||0),seconds:activities.reduce((v,a)=>v+(a.seconds||0),baseline?.seconds||0)};
 }
 
-return {uid,clone,empty,ensure,dateTime,installationDate,migrateInstallationDates,today,nowLocal,parentAt,treeValid,batchMove,activateMovedGear,expand,equipmentDistanceIncluded,distanceSnapshot,preserveDistanceSnapshot,deleteGear,restoreGear,saveGear,saveAssignment,importGear,mergeActivities,stats};
+return {uid,clone,empty,ensure,dateTime,activityInstant,installationDate,shanghaiTime,installationTime,buildTimedAssemblyIndex,hasTimedAssembly,activityTimeUncertain,migrateInstallationDates,today,nowLocal,parentAt,treeValid,batchMove,activateMovedGear,expand,equipmentDistanceIncluded,distanceSnapshot,preserveDistanceSnapshot,deleteGear,restoreGear,saveGear,readAssignmentOverrides,updateAssignmentSync,reconcileActivityMappings,saveAssignment,observeActivityGear,refreshRemoteGears,importGear,mergeActivities,stats};
 };
 modules["lib/categories.mjs"] = function(){
 const {randomUUID} = require("node:crypto");
@@ -601,8 +793,9 @@ return {builtinCategories,ensureCategories,saveCategory,deleteCategory};
 };
 modules["lib/history.mjs"] = function(){
 const {readGearStatus} = require("lib/gear-state.mjs");
-const {uid,clone,ensure,installationDate,nowLocal,treeValid,activateMovedGear} = require("lib/domain.mjs");
-const records=(s,id)=>s.events.filter(e=>e.gearId===id).sort((a,b)=>a.at.localeCompare(b.at));
+const {uid,clone,ensure,installationTime,nowLocal,treeValid,activateMovedGear} = require("lib/domain.mjs");
+const {compareTimeline} = require("lib/timeline-time.mjs");
+const records=(s,id)=>s.events.filter(e=>e.gearId===id).sort(compareTimeline);
 function install(s,gearId,events){
  const next=s.events.filter(e=>e.gearId!==gearId).concat(events);
  ensure(treeValid(s,next),'所属装备不能是自身或子装备（含后续历史关系）');
@@ -614,25 +807,26 @@ function record(s,gearId,before,action){
 }
 function saveInstallation(s,input){
  ensure(s.gears.some(g=>g.id===input.gearId&&!g.deletedAt),'装备不存在或已删除');
- const at=installationDate(input.at);ensure(at<=nowLocal(),'不能设置未来的装配时间');
+ const time=installationTime(input.at,input.instant),at=time.at;ensure(time.instant||at<=nowLocal(),'不能设置未来的装配时间');
  ensure(input.parentId===null||s.gears.some(g=>g.id===input.parentId&&!g.deletedAt),'所属装备不存在或已删除');
  const before=clone(records(s,input.gearId));
- const boundary=before.find(e=>e.id===input.id)?.at||at;
- ensure(!(s.gearOperations||[]).some(op=>op.gearIds.includes(input.gearId)&&op.at>=(boundary<at?boundary:at)),'请通过更换或库存记录修改这次装配。');
+ const original=before.find(e=>e.id===input.id),boundary=original&&compareTimeline(original,time)<0?original:time;
+ ensure(!(s.gearOperations||[]).some(op=>op.gearIds.includes(input.gearId)&&compareTimeline(op,boundary)>=0),'请通过更换或库存记录修改这次装配。');
  if(input.id)ensure(before.some(e=>e.id===input.id),'装配记录不存在');
  ensure(!before.some(e=>e.id===input.id&&e.operationId),'请通过更换或库存记录修改这次装配。');
- ensure(!before.some(e=>e.id!==input.id&&e.at.slice(0,10)===at.slice(0,10)),'当天已有装配记录，请编辑原记录。');
- const event={id:input.id||uid(),gearId:input.gearId,parentId:input.parentId,at,allDay:true};
- const status=input.parentId===null&&readGearStatus(s,input.gearId,at)==='stock'?'stock':'active';
+ ensure(!before.some(e=>e.id!==input.id&&e.at.slice(0,10)===at.slice(0,10)&&
+  (time.allDay||e.instant===time.instant||(!e.instant&&e.at===at))),time.allDay?'当天已有装配记录，请编辑原记录。':'生效时间已有装配记录，请编辑原记录。');
+ const event={id:input.id||uid(),gearId:input.gearId,parentId:input.parentId,...time};
+ const status=input.parentId===null&&readGearStatus(s,input.gearId,at,true,undefined,time.instant)==='stock'?'stock':'active';
  install(s,input.gearId,before.filter(e=>e.id!==input.id).concat(event));
  s.gearStates=(s.gearStates||[]).filter(e=>e.installationId!==event.id);
- activateMovedGear(s,input.gearId,at,event.id,status);
+ activateMovedGear(s,input.gearId,at,event.id,status,time.instant);
  record(s,input.gearId,before,input.id?'编辑':'新增');return event;
 }
 function deleteInstallation(s,{gearId,id}){
  ensure(s.gears.some(g=>g.id===gearId&&!g.deletedAt),'装备不存在或已删除');
  const before=clone(records(s,gearId));ensure(before.some(e=>e.id===id),'装配记录不存在');
- ensure(!(s.gearOperations||[]).some(op=>op.gearIds.includes(gearId)&&op.at>=before.find(e=>e.id===id).at),'请通过更换或库存记录修改这次装配。');
+ ensure(!(s.gearOperations||[]).some(op=>op.gearIds.includes(gearId)&&compareTimeline(op,before.find(e=>e.id===id))>=0),'请通过更换或库存记录修改这次装配。');
  ensure(!before.some(e=>e.id===id&&e.operationId),'请通过更换或库存记录修改这次装配。');
  s.gearStates=(s.gearStates||[]).filter(e=>e.installationId!==id);
  install(s,gearId,before.filter(e=>e.id!==id));record(s,gearId,before,'删除');return {ok:true};
@@ -648,6 +842,7 @@ return {saveInstallation,deleteInstallation,undoInstallation};
 };
 modules["lib/organize.mjs"] = function(){
 const {clone,ensure,uid,nowLocal,treeValid} = require("lib/domain.mjs");
+const {compareTimeline} = require("lib/timeline-time.mjs");
 
 function rootOf(parents,id){
  const seen=new Set();
@@ -657,8 +852,10 @@ function rootOf(parents,id){
 
 // Evaluate the original timeline, so batch order never changes eligibility.
 function plan(s,changes){
- ensure(Array.isArray(changes)&&changes.length>0&&changes.length<500,'没有可保存的修改');
+ ensure(Array.isArray(changes)&&changes.length>0,'没有可保存的修改');
+ ensure(changes.length<500,'每次最多调整 499 件装备，请减少选择后重试。');
  const ids=new Set(),gears=new Map(s.gears.map(g=>[g.id,g]));
+ ensure(!s.gears.some(g=>g.deletedAt&&s.events.some(e=>e.instant&&e.at.slice(0,10)===g.deletedAt.slice(0,10))),'删除记录缺少可靠时刻，无法安全整理同日装配。');
  for(const c of changes){
   ensure(gears.has(c.gearId)&&!gears.get(c.gearId).deletedAt,'装备不存在或已删除');
   ensure(!ids.has(c.gearId),'装备重复');ids.add(c.gearId);
@@ -666,25 +863,26 @@ function plan(s,changes){
   ensure(gears.has(c.fromParentId)&&gears.has(c.parentId)&&!gears.get(c.parentId).deletedAt,'所属装备不存在或已删除');
   ensure(c.gearId!==c.parentId,'所属装备不能是自身');
  }
- const boundaries=[...new Set([...s.events.map(e=>e.at),...s.gears.map(g=>g.deletedAt).filter(Boolean)])].sort();
- const byTime=new Map(boundaries.map(t=>[t,s.events.filter(e=>e.at===t)]));
+ const points=[...s.events.map(e=>({at:e.at,...(e.instant?{instant:e.instant,allDay:false}:{})})),...s.gears.map(g=>g.deletedAt).filter(Boolean).map(at=>({at}))].sort(compareTimeline);
+ const boundaries=[];for(const point of points)if(!boundaries.length||compareTimeline(boundaries.at(-1),point)!==0)boundaries.push(point);
+ const byTime=boundaries.map(t=>s.events.filter(e=>compareTimeline(e,t)===0));
  const parents=new Map(),rows=changes.map(c=>({...c,ranges:[],unchangedRanges:[]}));
  const histories=new Map(changes.map(c=>[c.gearId,[]]));
  const previous=new Map(),previousOriginal=new Map();
- function range(list,from,to){const last=list.at(-1);if(last&&last.to===from)last.to=to;else list.push({from,to});}
+ function range(list,from,to){const last=list.at(-1),end=to?.at||null,endInstant=to?.instant||null;if(last&&last.to===from.at&&(last.toInstant||null)===(from.instant||null)){last.to=end;last.toInstant=endInstant;}else list.push({from:from.at,to:end,...(from.instant?{fromInstant:from.instant}:{}),...(endInstant?{toInstant:endInstant}:{})});}
  for(let i=0;i<boundaries.length;i++){
-  const at=boundaries[i],to=boundaries[i+1]||null,events=byTime.get(at);
+  const point=boundaries[i],at=point.at,to=boundaries[i+1]||null,events=byTime[i];
   for(const e of events)parents.set(e.gearId,e.parentId);
   for(const row of rows){
    const {gearId,fromParentId,parentId}=row,original=parents.get(gearId)||null;
    const present=id=>!gears.get(id)?.deletedAt||at<gears.get(id).deletedAt;
    const eligible=original===fromParentId&&present(gearId)&&present(parentId)&&rootOf(parents,gearId)===rootOf(parents,parentId);
    const desired=eligible?parentId:original,existing=events.find(e=>e.gearId===gearId);
-   if(eligible)range(row.ranges,at,to);
-   else if(original===fromParentId)range(row.unchangedRanges,at,to);
+   if(eligible)range(row.ranges,point,to);
+   else if(original===fromParentId)range(row.unchangedRanges,point,to);
    // Preserve original timestamps/IDs. Remove only boundaries made redundant by this correction.
    if(desired!==(previous.get(gearId)||null)||existing&&original===(previousOriginal.get(gearId)||null)){
-    histories.get(gearId).push(existing?{...existing,parentId:desired}:{id:uid(),gearId,parentId:desired,at});
+    histories.get(gearId).push(existing?{...existing,parentId:desired}:{id:uid(),gearId,parentId:desired,at,...(point.instant?{instant:point.instant,allDay:false}:{})});
    }
    previous.set(gearId,desired);previousOriginal.set(gearId,original);
   }
@@ -694,9 +892,10 @@ function plan(s,changes){
  ensure(treeValid(s,next),'所属装备不能是自身或子装备（含历史关系）');
  // Guard against coordinated moves that would change a root despite individual eligibility.
  const nextParents=new Map(),oldParents=new Map();
- for(const at of boundaries){
-  for(const e of byTime.get(at))oldParents.set(e.gearId,e.parentId);
-  for(const e of next.filter(e=>e.at===at))nextParents.set(e.gearId,e.parentId);
+ for(let i=0;i<boundaries.length;i++){
+  const point=boundaries[i];
+  for(const e of byTime[i])oldParents.set(e.gearId,e.parentId);
+  for(const e of next.filter(e=>compareTimeline(e,point)===0))nextParents.set(e.gearId,e.parentId);
   ensure(s.gears.every(g=>rootOf(oldParents,g.id)===rootOf(nextParents,g.id)),'整理层级不能改变装备归属，请使用变更装配');
  }
  return {events:next,preview:{revision:s.revision,changes:clone(changes),rows,changed:rows.filter(r=>r.ranges.length).length}};
@@ -714,10 +913,11 @@ function applyOrganization(s,changes){
 return {previewOrganization,applyOrganization};
 };
 modules["lib/recompute.mjs"] = function(){
-const {uid,clone,ensure,dateTime,nowLocal,today,expand,stats,equipmentDistanceIncluded,distanceSnapshot} = require("lib/domain.mjs");
+const {uid,clone,ensure,dateTime,nowLocal,today,expand,stats,equipmentDistanceIncluded,distanceSnapshot,readAssignmentOverrides,activityTimeUncertain,hasTimedAssembly,shanghaiTime,buildTimedAssemblyIndex} = require("lib/domain.mjs");
 function date(value){ensure(typeof value==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(value),'请选择日期范围');dateTime(value+'T00:00:00');return value;}
 function descendants(rows,id){const ids=new Set([id]);let size;do{size=ids.size;for(const row of rows)if(ids.has(row.parentId))ids.add(row.id);}while(ids.size!==size);return ids;}
 function activityUsage(a){return {main:a.main,extras:a.extras||[],excluded:a.excluded||[],manual:!!a.manual,snapshot:a.snapshot||[],recomputedGearIds:a.recomputedGearIds||[]};}
+function stable(v){if(Array.isArray(v))return v.map(stable);if(v&&typeof v==='object')return Object.fromEntries(Object.keys(v).sort().map(k=>[k,stable(v[k])]));return v;}
 function missingRanges(s,from,to){
  const days=x=>Math.floor(Date.parse(x+'T00:00:00Z')/86400000),format=x=>new Date(x*86400000).toISOString().slice(0,10);
  const intervals=(s.syncLog||[]).map(x=>[Math.max(days(from),days(x.oldest)),Math.min(days(to),days(x.newest))]).filter(([a,b])=>a<=b).sort((a,b)=>a[0]-b[0]);
@@ -733,22 +933,24 @@ function planRecompute(s,input){
  const scope=input.scope||'self',manual=input.manual||'preserve';ensure(['self','subtree'].includes(scope)&&['preserve','recalculate'].includes(manual),'重算选项无效');
  const start=from+'T00:00:00',end=to+'T23:59:59',gearIds=new Set(targets.map(g=>g.id)),rows=[],patches=[];
  if(!category&&scope==='subtree')for(const at of [start,...s.events.filter(e=>e.at>=start&&e.at<=end).map(e=>e.at)])for(const row of expand(s,[gear.id],at))gearIds.add(row.id);
- const skipped={manual:0,unavailable:0,undatedUnavailable:0,missingMain:0,incompleteMetrics:0};
+ const skipped={manual:0,unavailable:0,undatedUnavailable:0,missingMain:0,incompleteMetrics:0,timeUnknown:0},timeIndex=buildTimedAssemblyIndex(s);
  for(const a of s.activities){
   if(a.deleted)continue;
   if(!a.at){if(a.summary||a.unavailable)skipped.undatedUnavailable++;continue;}
-  if(a.at<start||a.at>end)continue;
+  const rangeAt=a.startInstant&&hasTimedAssembly(s,a,timeIndex)?shanghaiTime(a.startInstant):a.at;
+  if(rangeAt<start||rangeAt>end)continue;
   if(a.summary||a.unavailable){skipped.unavailable++;continue;}
+  if(activityTimeUncertain(s,a,timeIndex)){skipped.timeUnknown++;continue;}
   if(!a.main)skipped.missingMain++;
   const current=a.snapshot||[];
-  const physical=category?new Set(targets.map(g=>g.id)):scope==='subtree'?new Set(expand(s,[gear.id],a.at).map(x=>x.id)):new Set([gear.id]);
+  const physical=category?new Set(targets.map(g=>g.id)):scope==='subtree'?new Set(expand(s,[gear.id],a.at,[],{instant:a.startInstant}).map(x=>x.id)):new Set([gear.id]);
   if(!category&&scope==='subtree')for(const id of descendants(current,gear.id))physical.add(id);
   for(const id of physical)gearIds.add(id);
-  const expanded=expand(s,[a.main,...(a.extras||[])],a.at,a.excluded||[]);
+  const expanded=expand(s,[a.main,...(a.extras||[])],a.at,a.excluded||[],{instant:a.startInstant});
   const expected=distanceSnapshot(expanded,equipmentDistanceIncluded(s,a,expanded),s);
   const oldRows=current.filter(x=>physical.has(x.id)),newRows=expected.filter(x=>physical.has(x.id));
   if(!oldRows.length&&!newRows.length)continue;
-  if(a.manual&&manual==='preserve'){skipped.manual++;rows.push({id:a.id,name:a.name,at:a.at,status:'manual',added:[],removed:[]});continue;}
+  if(readAssignmentOverrides(a).assembly&&manual==='preserve'){skipped.manual++;rows.push({id:a.id,name:a.name,at:a.at,status:'manual',added:[],removed:[]});continue;}
   const retained=current.filter(x=>!physical.has(x.id)),present=new Set([...retained,...newRows].map(x=>x.id));
   const normalized=newRows.map(x=>({...x,parentId:present.has(x.parentId)?x.parentId:null}));
   const afterSnapshot=[...retained,...normalized];
@@ -756,15 +958,16 @@ function planRecompute(s,input){
   for(let i=0;i<afterSnapshot.length;i++)if(afterSnapshot[i].parentId&&!present.has(afterSnapshot[i].parentId))afterSnapshot[i]={...afterSnapshot[i],parentId:null};
   const oldIds=new Set(oldRows.map(x=>x.id)),newIds=new Set(newRows.map(x=>x.id));
   const added=[...newIds].filter(id=>!oldIds.has(id)),removed=[...oldIds].filter(id=>!newIds.has(id));
-  const canonical=x=>JSON.stringify([...x].sort((a,b)=>a.id.localeCompare(b.id)));
+  const canonical=x=>JSON.stringify(stable([...x].sort((a,b)=>a.id.localeCompare(b.id))));
   const changed=canonical(current)!==canonical(afterSnapshot);
   const membership=x=>x.map(({distanceIncluded,...row})=>row);
   const distanceOnly=changed&&canonical(membership(current))===canonical(membership(afterSnapshot));
   if(a.distance===null||a.seconds===null)skipped.incompleteMetrics++;
   rows.push({id:a.id,name:a.name,at:a.at,status:added.length||removed.length?'changed':distanceOnly?'distance':changed?'assembly':'unchanged',added,removed,distance:a.distance,seconds:a.seconds,distanceExcluded:newRows.some(x=>x.distanceIncluded===false)});
-  if(changed){const before=clone(activityUsage(a));patches.push({id:a.id,before,after:{...before,snapshot:afterSnapshot,recomputedGearIds:[...new Set([...before.recomputedGearIds,...physical])]}});}
+  const resolvesTime=!!a.assemblyTimeUnknown&&current.every(row=>physical.has(row.id))&&expected.every(row=>physical.has(row.id));
+  if(changed||resolvesTime){const before=clone(activityUsage(a));patches.push({id:a.id,before,after:{...before,snapshot:afterSnapshot,recomputedGearIds:[...new Set([...before.recomputedGearIds,...physical])]},timeBasis:{at:a.at,startInstant:a.startInstant||null},...(resolvesTime?{timeUnknownBefore:true,timeUnknownAfter:false}:{})});}
  }
- const next=clone(s);for(const patch of patches){const a=next.activities.find(x=>x.id===patch.id);a.snapshot=clone(patch.after.snapshot);a.recomputedGearIds=clone(patch.after.recomputedGearIds);}
+ const next=clone(s);for(const patch of patches){const a=next.activities.find(x=>x.id===patch.id);a.snapshot=clone(patch.after.snapshot);a.recomputedGearIds=clone(patch.after.recomputedGearIds);if(patch.timeUnknownBefore)a.assemblyTimeUnknown=false;}
  for(const g of next.gears)if(gearIds.has(g.id))g.totalsMode='local';
  const totals=[...gearIds].map(id=>({id,name:s.gears.find(g=>g.id===id)?.name||id,before:stats(s,id),after:stats(next,id),baselineDisabled:!!s.gears.find(g=>g.id===id)?.importedTotals&&s.gears.find(g=>g.id===id)?.totalsMode!=='local'}));
  return {options:{...(category?{categoryId:category.id}:{gearId:gear.id}),from,to,scope:category?'self':scope,manual},revision:s.revision,gearIds:[...gearIds],rows:rows.sort((a,b)=>b.at.localeCompare(a.at)),totals,skipped,gaps:missingRanges(s,from,to),added:rows.filter(x=>x.added.length).length,removed:rows.filter(x=>x.removed.length).length,changed:patches.length,patches};
@@ -772,7 +975,7 @@ function planRecompute(s,input){
 function previewRecompute(s,input){const {patches,...preview}=planRecompute(s,input);return preview;}
 function applyRecompute(s,input){
  const plan=planRecompute(s,input),modes=plan.gearIds.map(id=>{const g=s.gears.find(x=>x.id===id);return {id,before:g.totalsMode??null,after:'local'};});
- for(const patch of plan.patches){const a=s.activities.find(x=>x.id===patch.id);a.snapshot=clone(patch.after.snapshot);a.recomputedGearIds=clone(patch.after.recomputedGearIds);}
+ for(const patch of plan.patches){const a=s.activities.find(x=>x.id===patch.id);a.snapshot=clone(patch.after.snapshot);a.recomputedGearIds=clone(patch.after.recomputedGearIds);if(patch.timeUnknownBefore)a.assemblyTimeUnknown=false;}
  for(const mode of modes)s.gears.find(g=>g.id===mode.id).totalsMode='local';
  const {patches,...summary}=plan;const operation={id:uid(),at:nowLocal(),...summary,patches,modes};(s.recalculations??=[]).push(operation);
  return {id:operation.id,...summary};
@@ -781,9 +984,9 @@ function undoRecompute(s,id){
  const op=(s.recalculations||[]).find(x=>x.id===id&&!x.undoneAt);ensure(op,'重算记录不存在或已撤销');
  // Prevent a later overlapping run (including a no-op) from being silently undone.
  const index=s.recalculations.indexOf(op);ensure(!s.recalculations.slice(index+1).some(x=>!x.undoneAt&&x.gearIds.some(id=>op.gearIds.includes(id))),'请先撤销后续重算');
- for(const patch of op.patches){const a=s.activities.find(x=>x.id===patch.id);ensure(a&&JSON.stringify(activityUsage(a))===JSON.stringify(patch.after),'活动装备已有后续修改，无法撤销');}
+ for(const patch of op.patches){const a=s.activities.find(x=>x.id===patch.id);ensure(a&&JSON.stringify(stable(activityUsage(a)))===JSON.stringify(stable(patch.after))&&(!patch.timeUnknownBefore||a.assemblyTimeUnknown===false)&&(!patch.timeBasis||a.at===patch.timeBasis.at&&(a.startInstant||null)===patch.timeBasis.startInstant),'活动装备已有后续修改，无法撤销');}
  for(const mode of op.modes)ensure(s.gears.find(g=>g.id===mode.id)?.totalsMode===mode.after,'统计方式已有后续修改，无法撤销');
- for(const patch of op.patches){const a=s.activities.find(x=>x.id===patch.id);a.snapshot=clone(patch.before.snapshot);a.recomputedGearIds=clone(patch.before.recomputedGearIds);}
+ for(const patch of op.patches){const a=s.activities.find(x=>x.id===patch.id);a.snapshot=clone(patch.before.snapshot);a.recomputedGearIds=clone(patch.before.recomputedGearIds);if(patch.timeUnknownBefore)a.assemblyTimeUnknown=true;}
  for(const mode of op.modes){const g=s.gears.find(x=>x.id===mode.id);if(mode.before===null)delete g.totalsMode;else g.totalsMode=mode.before;}
  op.undoneAt=nowLocal();return {ok:true};
 }
@@ -873,10 +1076,29 @@ function snapshotCutoff(date, now) {
  return date===now.slice(0,10)?now:date+'T23:59:59';
 }
 
-function snapshotStats(state, gear, cutoff) {
+function buildActivityIndex(state) {
+ // Group saved membership once per view; never infer it from today's equipment tree.
+ const byGear=new Map();
+ let limited=false;
+ for(const activity of state.activities){
+  if(!activity.deleted&&(activity.unavailable||activity.summary||!Number.isFinite(activity.distance)))limited=true;
+  if(activity.deleted||activity.summary||activity.unavailable)continue;
+  const seen=new Set();
+  for(const row of activity.snapshot||[]){
+   if(seen.has(row.id))continue;
+   seen.add(row.id);
+   if(!byGear.has(row.id))byGear.set(row.id,[]);
+   byGear.get(row.id).push(activity);
+  }
+ }
+ return {byGear,limited};
+}
+
+function snapshotStats(state, gear, cutoff, activityIndex) {
  const baseline=gear.totalsMode==='local'?null:gear.importedTotals;
  const blocked=!!baseline&&baseline.through>cutoff;
- const rows=state.activities.filter(a=>a.at&&a.at<=cutoff&&!a.deleted&&!a.summary&&!a.unavailable&&
+ const source=activityIndex?activityIndex.byGear.get(gear.id)||[]:state.activities;
+ const rows=source.filter(a=>a.at&&a.at<=cutoff&&!a.deleted&&!a.summary&&!a.unavailable&&
   a.snapshot?.some(x=>x.id===gear.id)&&(!baseline||blocked||a.at>baseline.through));
  const recorded={distance:0,seconds:0,count:rows.length};
  let missing=false;
@@ -921,27 +1143,36 @@ function buildSnapshot(state, date, now) {
   .map(e=>({...e,parentId:ids.has(e.parentId)?e.parentId:null}));
  const gearEvents=(state.gearEvents||[]).filter(e=>ids.has(e.gearId)&&
   e.occurredDate+'T'+(e.occurredTime||'00:00')+':00'<=cutoff);
+ const activities=state.activities.filter(a=>a.at&&a.at<=cutoff);
+ const activityIndex=buildActivityIndex({activities});
  const view={...state,gears,events,gearEvents,
   gearStates:(state.gearStates||[]).filter(e=>e.at<=cutoff&&ids.has(e.gearId)),
   gearOperations:(state.gearOperations||[]).filter(e=>e.at<=cutoff&&ids.has(e.gearId)),
-  activities:state.activities.filter(a=>a.at&&a.at<=cutoff),
+  activities,
   snapshotView:{date,cutoff},
-  statistics:Object.fromEntries(gears.map(g=>[g.id,snapshotStats(state,g,cutoff)]))
+  statistics:Object.fromEntries(gears.map(g=>[g.id,snapshotStats(state,g,cutoff,activityIndex)]))
  };
- view.eventStatistics=Object.fromEntries(gearEvents.map(e=>[e.id,calculateEventMetrics(view,e,cutoff)]));
+ view.eventStatistics=Object.fromEntries(gearEvents.map(e=>[e.id,calculateEventMetrics(view,e,cutoff,activityIndex)]));
  return view;
 }
 
-function calculateEventMetrics(s,event,now){
+function calculateEventMetrics(s,event,now,activityIndex){
  const boundary=event.occurredDate+'T'+(event.occurredTime||'00:00')+':00';
  const after=event.occurredTime?boundary:new Date(Date.parse(event.occurredDate+'T00:00:00Z')+86400000).toISOString().slice(0,10)+'T00:00:00';
  const gear=s.gears.find(g=>g.id===event.gearId),baseline=gear?.totalsMode==='local'?null:gear?.importedTotals;
- const rows=s.activities.filter(a=>!a.deleted&&!a.summary&&!a.unavailable&&a.at<=now&&Number.isFinite(a.distance)&&a.distance>=0&&a.snapshot?.some(x=>x.id===event.gearId)&&a.snapshot.find(x=>x.id===event.gearId).distanceIncluded!==false);
+ const source=activityIndex?activityIndex.byGear.get(event.gearId)||[]:s.activities;
+ let rows;
+ const cached=activityIndex?.eventMetricsRows?.get(event.gearId);
+ if(cached&&cached.now===now)rows=cached.rows;
+ else {
+  rows=source.filter(a=>!a.deleted&&!a.summary&&!a.unavailable&&a.at<=now&&Number.isFinite(a.distance)&&a.distance>=0&&a.snapshot?.some(x=>x.id===event.gearId)&&a.snapshot.find(x=>x.id===event.gearId).distanceIncluded!==false);
+  if(activityIndex){activityIndex.eventMetricsRows??=new Map();activityIndex.eventMetricsRows.set(event.gearId,{now,rows});}
+ }
  const sum=predicate=>rows.filter(predicate).reduce((v,a)=>v+a.distance,0);
- return {distance:sum(a=>a.at>=after),days:Math.round((Date.parse(now.slice(0,10))-Date.parse(event.occurredDate))/86400000),total:baseline&&baseline.through>boundary?null:(baseline?.distance||0)+sum(a=>a.at<boundary&&(!baseline||a.at>baseline.through)),limited:s.activities.some(a=>!a.deleted&&(a.unavailable||a.summary||!Number.isFinite(a.distance)))};
+ return {distance:sum(a=>a.at>=after),days:Math.round((Date.parse(now.slice(0,10))-Date.parse(event.occurredDate))/86400000),total:baseline&&baseline.through>boundary?null:(baseline?.distance||0)+sum(a=>a.at<boundary&&(!baseline||a.at>baseline.through)),limited:activityIndex?activityIndex.limited:s.activities.some(a=>!a.deleted&&(a.unavailable||a.summary||!Number.isFinite(a.distance)))};
 }
 
-return {snapshotCutoff,snapshotStats,buildSnapshot,calculateEventMetrics};
+return {snapshotCutoff,buildActivityIndex,snapshotStats,buildSnapshot,calculateEventMetrics};
 };
 modules["lib/photos.mjs"] = function(){
 const {createHash} = require("node:crypto");
@@ -998,7 +1229,14 @@ function addPhoto(s,input,metadata){
  (s.photos??=[]).push(row);return row;
 }
 function editPhotos(s,input){
- const {ownerType,ownerId,ids,action,id}=input;
+ const {ownerType,ownerId,ids,action,id,gearId}=input;
+ if(ownerType==='draft'){
+  ensure(action==='delete','草稿图片仅可移除。');
+  photoOwner(s,ownerType,ownerId,gearId);
+  const photo=ownerPhotos(s,ownerType,ownerId).find(p=>p.id===id);
+  ensure(input.confirmed===true&&photo&&photo.gearId===gearId,'无法移除图片，请重新打开记录后重试。');
+  s.photos=s.photos.filter(p=>p.id!==id);return {ok:true};
+ }
  ensure(['gear','activity'].includes(ownerType),'请通过编辑记录管理图片');
  photoOwner(s,ownerType,ownerId);
  const photos=ownerPhotos(s,ownerType,ownerId),photo=photos.find(p=>p.id===id);

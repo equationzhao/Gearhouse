@@ -25,7 +25,274 @@ struct NativeBackupVersion: Identifiable, Sendable {
     var id: String { manifest.id }
 }
 
+enum NativeBackupUploadFailure: Sendable {
+    case quota, unavailable
+    init?(_ failure: Error) {
+        let error = failure as NSError
+        guard error.domain == NSCocoaErrorDomain else { return nil }
+        switch error.code {
+        case NSUbiquitousFileNotUploadedDueToQuotaError: self = .quota
+        case NSUbiquitousFileUbiquityServerNotAvailable: self = .unavailable
+        default: return nil
+        }
+    }
+    var message: String {
+        switch self {
+        case .quota: return "iCloud 空间不足，请清理空间后重试。"
+        case .unavailable: return "暂时无法连接 iCloud，请稍后重试。"
+        }
+    }
+}
+
+struct NativeBackupVersionScan: Sendable {
+    let versions: [NativeBackupVersion]
+    let pendingCount: Int
+    let unreadableCount: Int
+    let discoveredCount: Int
+    var uploadFailure: NativeBackupUploadFailure? = nil
+    var complete: Bool { pendingCount == 0 && unreadableCount == 0 }
+    var readMessage: String? {
+        if let uploadFailure { return uploadFailure.message }
+        switch (pendingCount > 0, unreadableCount > 0) {
+        case (true, false): return "有备份尚未下载完成，请稍后重新读取。"
+        case (false, true): return "有备份无法读取，请重新读取或选择其他备份。"
+        case (true, true): return "有备份尚未下载完成，另有备份无法读取。请稍后重新读取或选择其他备份。"
+        default: return nil
+        }
+    }
+}
+
+enum NativeBackupFileSelection: Sendable {
+    case json(Data)
+    case package(NativeBackupVersion)
+}
+
+enum NativeBackupFiles {
+    static let maximumJSONBytes = 500 * 1024 * 1024
+    private static let exportSizeMessage = "备份文件过大，无法导出为 JSON。请使用 iCloud Drive 自动备份。"
+
+    static func prepareExport(state: Value, media: URL) async throws -> Data {
+        try await prepareExport(state: state, media: media, maximumBytes: maximumJSONBytes, beforeRead: nil)
+    }
+    static func readSelection(from url: URL) async throws -> NativeBackupFileSelection {
+        try await readSelection(from: url, maximumBytes: maximumJSONBytes, beforeRead: nil)
+    }
+    static func validateJSONSize(_ count: Int, exporting: Bool = false) throws {
+        try validateJSONSize(count, maximumBytes: maximumJSONBytes, exporting: exporting)
+    }
+    private static func validateJSONSize(_ count: Int, maximumBytes: Int, exporting: Bool) throws {
+        guard count >= 0, count < maximumBytes else { throw DomainError(exporting ? exportSizeMessage : "备份过大") }
+    }
+    private static func coordinatedRead<T>(_ url: URL, _ action: (URL) throws -> T) throws -> T {
+        var coordinationError: NSError?, result: Result<T, Error>?
+        NSFileCoordinator().coordinate(readingItemAt: url, options: .withoutChanges, error: &coordinationError) { target in
+            result = Result { try action(target) }
+        }
+        if let coordinationError { throw coordinationError }
+        guard let result else { throw NativeBackupError.location }
+        return try result.get()
+    }
+    private static func joinWorker<T: Sendable>(_ worker: Task<T, Error>) async throws -> T {
+        let value = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+        try Task.checkCancellation()
+        return value
+    }
+    private static func prepareExport(state: Value, media: URL, maximumBytes: Int,
+                                      beforeRead: (@Sendable (URL) async throws -> Void)?) async throws -> Data {
+        try Task.checkCancellation()
+        let worker = Task.detached(priority: .userInitiated) { () async throws -> Data in
+            try Task.checkCancellation()
+            var photos: [String: Value] = [:], attachments: [String: Value] = [:]
+            var encodedMediaBytes = 0
+            func reserveEncodedBytes(_ bytes: Data) throws {
+                try validateJSONSize(bytes.count, maximumBytes: maximumBytes, exporting: true)
+                encodedMediaBytes += 4 * ((bytes.count + 2) / 3)
+                try validateJSONSize(encodedMediaBytes, maximumBytes: maximumBytes, exporting: true)
+            }
+            for photo in state["photos"].array {
+                try Task.checkCancellation()
+                guard UUID(uuidString: photo.id) != nil else { throw DomainError("备份图片标识无效") }
+                let file = media.appendingPathComponent(photo.id + ".jpg")
+                try await beforeRead?(file)
+                try Task.checkCancellation()
+                let bytes = try coordinatedRead(file) { try Data(contentsOf: $0) }
+                try Task.checkCancellation()
+                try reserveEncodedBytes(bytes)
+                photos[photo.id] = .string(bytes.base64EncodedString())
+            }
+            for record in state["attachments"].array {
+                try Task.checkCancellation()
+                let file = media.appendingPathComponent(try GearAttachment.fileName(record))
+                try await beforeRead?(file)
+                try Task.checkCancellation()
+                let bytes = try coordinatedRead(file) { try Data(contentsOf: $0) }
+                try Task.checkCancellation()
+                try reserveEncodedBytes(bytes)
+                attachments[record.id] = .string(bytes.base64EncodedString())
+            }
+            try Task.checkCancellation()
+            let data = try Value.object(["state": state, "media": .object(photos), "attachments": .object(attachments)]).jsonData()
+            try validateJSONSize(data.count, maximumBytes: maximumBytes, exporting: true)
+            try Task.checkCancellation()
+            return data
+        }
+        return try await joinWorker(worker)
+    }
+    private static func readSelection(from url: URL, maximumBytes: Int,
+                                       beforeRead: (@Sendable (URL) async throws -> Void)?) async throws -> NativeBackupFileSelection {
+        try Task.checkCancellation()
+        let worker = Task.detached(priority: .userInitiated) { () async throws -> NativeBackupFileSelection in
+            try Task.checkCancellation()
+            let access = url.startAccessingSecurityScopedResource()
+            defer { if access { url.stopAccessingSecurityScopedResource() } }
+            let package = url.pathExtension.lowercased() == GearBackupArchive.fileExtension
+            if !package {
+                try coordinatedRead(url) { target in
+                    var file = target; file.removeAllCachedResourceValues()
+                    try validateJSONSize(try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, maximumBytes: maximumBytes, exporting: false)
+                }
+            }
+            try await beforeRead?(url)
+            try Task.checkCancellation()
+            return try coordinatedRead(url) { target in
+                try Task.checkCancellation()
+                if package {
+                    let manifest = try GearBackupArchive.manifest(at: target)
+                    try Task.checkCancellation()
+                    return .package(NativeBackupVersion(manifest: manifest, url: url, uploaded: false, local: true))
+                }
+                var file = target; file.removeAllCachedResourceValues()
+                try validateJSONSize(try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0, maximumBytes: maximumBytes, exporting: false)
+                let data = try Data(contentsOf: file)
+                try validateJSONSize(data.count, maximumBytes: maximumBytes, exporting: false)
+                try Task.checkCancellation()
+                return .json(data)
+            }
+        }
+        return try await joinWorker(worker)
+    }
+    #if DEBUG
+    static func prepareExport(state: Value, media: URL, beforeRead: (@Sendable (URL) async throws -> Void)?,
+                              maximumBytes: Int = maximumJSONBytes) async throws -> Data {
+        precondition(maximumBytes > 0 && maximumBytes <= maximumJSONBytes)
+        return try await prepareExport(state: state, media: media, maximumBytes: maximumBytes, beforeRead: beforeRead)
+    }
+    static func readSelection(from url: URL, beforeRead: (@Sendable (URL) async throws -> Void)?,
+                              maximumBytes: Int = maximumJSONBytes) async throws -> NativeBackupFileSelection {
+        precondition(maximumBytes > 0 && maximumBytes <= maximumJSONBytes)
+        return try await readSelection(from: url, maximumBytes: maximumBytes, beforeRead: beforeRead)
+    }
+    #endif
+}
+
 /// All coordinated file access, image copying and validation happens off the UI actor.
+enum NativeBackupSafety {
+    private struct Medium {
+        let name: String
+        let hash: String
+        let bytes: Int?
+        let attachment: Bool
+    }
+    private static func readAttributes(_ url: URL) throws -> [FileAttributeKey: Any]? {
+        do { return try FileManager.default.attributesOfItem(atPath: url.path) }
+        catch {
+            let failure = error as NSError
+            let missing = failure.domain == NSCocoaErrorDomain && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(failure.code)
+                || failure.domain == NSPOSIXErrorDomain && failure.code == Int(POSIXErrorCode.ENOENT.rawValue)
+            guard missing else { throw error }
+            return nil
+        }
+    }
+    private static func requireRegularFile(_ attributes: [FileAttributeKey: Any]) throws {
+        guard attributes[.type] as? FileAttributeType == .typeRegular else {
+            throw DomainError("无法保留本机原文件，请检查存储空间后重试恢复。")
+        }
+    }
+    private static func readMediaFiles(_ directory: URL) throws -> [URL] {
+        guard let attributes = try readAttributes(directory) else { return [] }
+        guard attributes[.type] as? FileAttributeType == .typeDirectory else {
+            throw DomainError("无法保留本机原文件，请检查存储空间后重试恢复。")
+        }
+        let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        for file in files {
+            guard let attributes = try readAttributes(file) else { throw NativeBackupError.location }
+            try requireRegularFile(attributes)
+        }
+        return files.sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+    /// Incomplete or unreadable local media can be preserved as originals, never as a restorable package.
+    static func preserveBeforeRestore(state: Value, directory: URL) throws -> URL {
+        let fm = FileManager.default, media = directory.appendingPathComponent("media")
+        try GearAttachment.validateRecords(in: state)
+        var references: [Medium] = [], names = Set<String>()
+        for photo in state["photos"].array {
+            guard UUID(uuidString: photo.id) != nil, names.insert(photo.id + ".jpg").inserted else { throw DomainError("备份图片标识无效") }
+            references.append(.init(name: photo.id + ".jpg", hash: photo["hash"].text, bytes: nil, attachment: false))
+        }
+        for attachment in state["attachments"].array {
+            let name = try GearAttachment.fileName(attachment)
+            guard names.insert(name).inserted else { throw DomainError("备份数据无效") }
+            references.append(.init(name: name, hash: attachment["hash"].text, bytes: attachment["bytes"].integer, attachment: true))
+        }
+        if let attributes = try readAttributes(media) {
+            guard attributes[.type] as? FileAttributeType == .typeDirectory else {
+                throw DomainError("无法保留本机原文件，请检查存储空间后重试恢复。")
+            }
+        }
+        var needsOriginalCopy = false
+        for reference in references {
+            let file = media.appendingPathComponent(reference.name)
+            if let attributes = try readAttributes(file) {
+                try requireRegularFile(attributes)
+                if !reference.attachment {
+                    if let image = CGImageSourceCreateWithURL(file as CFURL, nil) {
+                        if CGImageSourceGetCount(image) == 0 { needsOriginalCopy = true }
+                    } else { needsOriginalCopy = true }
+                }
+            } else { needsOriginalCopy = true }
+        }
+        if !needsOriginalCopy {
+            return try GearBackupArchive.create(state: state, media: media, in: directory.appendingPathComponent("Recovery"))
+        }
+        let source = directory.appendingPathComponent("state-v2.json")
+        guard let attributes = try readAttributes(source) else { throw NativeBackupError.location }
+        try requireRegularFile(attributes)
+        let bytes = try Data(contentsOf: source)
+        guard try Value.decode(bytes) == state else { throw NativeBackupError.location }
+        let files = try readMediaFiles(media)
+        let original = directory.appendingPathComponent("Recovery/Original-" + UUID().uuidString.lowercased(), isDirectory: true)
+        do {
+            let copies = original.appendingPathComponent("media", isDirectory: true)
+            try fm.createDirectory(at: copies, withIntermediateDirectories: true)
+            let savedState = original.appendingPathComponent("state-v2.json")
+            try bytes.write(to: savedState, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            for file in files {
+                let digest = try GearBackupArchive.hash(file)
+                if let reference = references.first(where: { $0.name == file.lastPathComponent }) {
+                    if let count = reference.bytes {
+                        guard (try readAttributes(file))?[.size] as? NSNumber == NSNumber(value: count) else { throw DomainError("附件文件不完整，请重新添加后再备份。") }
+                    }
+                    guard digest == reference.hash else {
+                        throw DomainError(reference.attachment ? "附件校验失败，请重新添加后再备份。" : "备份图片校验失败")
+                    }
+                }
+                let destination = copies.appendingPathComponent(file.lastPathComponent)
+                try fm.copyItem(at: file, to: destination)
+                guard try GearBackupArchive.hash(destination) == digest, try GearBackupArchive.hash(file) == digest else { throw NativeBackupError.location }
+            }
+            guard try Data(contentsOf: savedState) == bytes, try Data(contentsOf: source) == bytes,
+                  try readMediaFiles(media).map(\.lastPathComponent) == files.map(\.lastPathComponent) else { throw NativeBackupError.location }
+            for file in files {
+                guard try GearBackupArchive.hash(file) == GearBackupArchive.hash(copies.appendingPathComponent(file.lastPathComponent)) else { throw NativeBackupError.location }
+            }
+            return original
+        } catch {
+            try? fm.removeItem(at: original)
+            throw error
+        }
+    }
+}
+
 actor NativeBackupWorker {
     private let fm = FileManager.default
     private func coordinated<T>(_ url: URL, write: Bool = false, options: NSFileCoordinator.WritingOptions = [], _ action: (URL) throws -> T) throws -> T {
@@ -91,28 +358,64 @@ actor NativeBackupWorker {
         }
         return true
     }
-    func versions(bookmark: Data, namespace: String) throws -> [NativeBackupVersion] {
+    func versions(bookmark: Data, namespace: String) throws -> NativeBackupVersionScan {
         let location = try root(bookmark, namespace: namespace)
         defer { location.scope.stopAccessingSecurityScopedResource() }
-        guard fm.fileExists(atPath: location.folder.path) else { return [] }
+        guard fm.fileExists(atPath: location.folder.path) else { return .init(versions: [], pendingCount: 0, unreadableCount: 0, discoveredCount: 0) }
         return try coordinated(location.folder) { folder in
-            var result: [NativeBackupVersion] = []
-            for file in try fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isUbiquitousItemKey], options: .skipsHiddenFiles)
-                where file.pathExtension == GearBackupArchive.fileExtension {
-                let manifestURL = file.appendingPathComponent("manifest.json")
-                if !fm.fileExists(atPath: manifestURL.path) {
-                    try? fm.startDownloadingUbiquitousItem(at: file)
-                    continue
-                }
-                guard let manifest = try? GearBackupArchive.manifest(at: file) else {
-                    try? fm.startDownloadingUbiquitousItem(at: file)
-                    continue
-                }
-                result.append(.init(manifest: manifest, url: file, uploaded: try uploaded(file, manifest: manifest), local: false))
-            }
-            return result.sorted { $0.manifest.createdAt > $1.manifest.createdAt }
+            try scanVersions(in: folder, isPending: manifestIsPending, requestDownload: requestManifestDownload)
         }
     }
+    private func manifestIsPending(_ package: URL) -> Bool {
+        for original in [package, package.appendingPathComponent("manifest.json")] {
+            var file = original; file.removeAllCachedResourceValues()
+            let values = try? file.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey, .ubiquitousItemIsDownloadingKey])
+            if values?.ubiquitousItemDownloadingStatus == .notDownloaded || values?.ubiquitousItemIsDownloading == true { return true }
+        }
+        return false
+    }
+    private func requestManifestDownload(_ package: URL) {
+        try? fm.startDownloadingUbiquitousItem(at: package)
+        try? fm.startDownloadingUbiquitousItem(at: package.appendingPathComponent("manifest.json"))
+    }
+    private func scanVersions(in folder: URL, isPending: (URL) -> Bool, requestDownload: (URL) -> Void,
+                              uploadStatus: ((URL, GearBackupManifest) throws -> Bool)? = nil) throws -> NativeBackupVersionScan {
+        guard fm.fileExists(atPath: folder.path) else { return .init(versions: [], pendingCount: 0, unreadableCount: 0, discoveredCount: 0) }
+        var result: [NativeBackupVersion] = []
+        var pending = 0, unreadable = 0, discovered = 0
+        var uploadFailure: NativeBackupUploadFailure?
+        for file in try fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isUbiquitousItemKey], options: .skipsHiddenFiles)
+            where file.pathExtension == GearBackupArchive.fileExtension {
+            discovered += 1
+            if isPending(file) {
+                pending += 1; requestDownload(file)
+                continue
+            }
+            do {
+                let manifest = try GearBackupArchive.manifest(at: file)
+                let wasUploaded: Bool
+                do { wasUploaded = try uploadStatus?(file, manifest) ?? uploaded(file, manifest: manifest) }
+                catch {
+                    unreadable += 1; wasUploaded = false
+                    if uploadFailure == nil { uploadFailure = NativeBackupUploadFailure(error) }
+                    NSLog("Gearhouse backup upload status could not be read: %@", error.localizedDescription)
+                }
+                result.append(.init(manifest: manifest, url: file, uploaded: wasUploaded, local: false))
+            } catch {
+                unreadable += 1
+                NSLog("Gearhouse backup manifest could not be read: %@", error.localizedDescription)
+            }
+        }
+        return .init(versions: result.sorted { $0.manifest.createdAt > $1.manifest.createdAt }, pendingCount: pending, unreadableCount: unreadable, discoveredCount: discovered, uploadFailure: uploadFailure)
+    }
+    #if DEBUG
+    func scanVersionsForTesting(in folder: URL, pendingPackages: Set<String> = [],
+                                uploadStatus: (@Sendable (URL, GearBackupManifest) throws -> Bool)? = nil) throws -> (scan: NativeBackupVersionScan, requestedDownloads: [String]) {
+        var requested: [String] = []
+        let scan = try scanVersions(in: folder, isPending: { pendingPackages.contains($0.lastPathComponent) }, requestDownload: { requested.append($0.lastPathComponent) }, uploadStatus: uploadStatus)
+        return (scan, requested)
+    }
+    #endif
     func prune(bookmark: Data, namespace: String, versions: [NativeBackupVersion]) throws -> Set<String> {
         guard versions.first?.uploaded == true else { return [] }
         let groups = Dictionary(grouping: versions, by: { $0.manifest.accountID ?? "" })
@@ -185,7 +488,7 @@ actor NativeBackupWorker {
         } catch { try? fm.removeItem(at: copy); throw error }
     }
     func safety(state: Value, directory: URL) throws -> URL {
-        try GearBackupArchive.create(state: state, media: directory.appendingPathComponent("media"), in: directory.appendingPathComponent("Recovery"))
+        try NativeBackupSafety.preserveBeforeRestore(state: state, directory: directory)
     }
     func localVersions(_ directory: URL) -> [NativeBackupVersion] {
         let files = (try? fm.contentsOfDirectory(at: directory.appendingPathComponent("Recovery"), includingPropertiesForKeys: nil, options: .skipsHiddenFiles)) ?? []
@@ -235,6 +538,9 @@ final class NativeCloudBackup: ObservableObject {
     private let worker = NativeBackupWorker()
     private weak var store: NativeStore?
     private var task: Task<Void, Never>?
+    #if DEBUG
+    var readVersionsForTesting: (() async throws -> NativeBackupVersionScan)?
+    #endif
     var hasLocation: Bool { settings.bookmark != nil }
     func waitingForUpload(_ version: NativeBackupVersion) -> Bool { !version.uploaded && version.id == settings.queuedID }
     init(directory: URL, isolated: Bool) {
@@ -279,7 +585,7 @@ final class NativeCloudBackup: ObservableObject {
         } catch { settings = previous; fail(error) }
     }
     func changed() {
-        guard enabled else { return }
+        guard enabled, store?.hasLoadedState == true else { return }
         task?.cancel()
         task = Task { [weak self] in
             do { try await Task.sleep(for: .seconds(5)) } catch { return }
@@ -287,7 +593,7 @@ final class NativeCloudBackup: ObservableObject {
         }
     }
     func tick(force: Bool = false) async {
-        guard enabled, !working, let store, !store.busy, !store.backupRestoring, let bookmark = settings.bookmark else { return }
+        guard enabled, !working, let store, store.hasLoadedState, !store.busy, !store.backupRestoring, let bookmark = settings.bookmark else { return }
         working = true; phase = "正在备份…"
         defer { working = false; phase = "" }
         do {
@@ -295,29 +601,35 @@ final class NativeCloudBackup: ObservableObject {
             let digest = try await worker.contentHash(state)
             let empty = state["gears"].array.isEmpty && state["activities"].array.isEmpty && state["gearEvents"].array.isEmpty
             if empty && settings.hash == nil {
-                try await loadVersions(bookmark)
-                if !versions.isEmpty { return }
+                let scan = try await loadVersions(bookmark)
+                if !versions.isEmpty || !scan.complete { return }
             }
             if force || digest != settings.hash {
                 let manifest = try await worker.publish(state: state, media: directory.appendingPathComponent("media"), work: directory.appendingPathComponent("BackupWork"), bookmark: bookmark, namespace: namespace)
                 settings.hash = digest; settings.queuedID = manifest.id; try saveSettings()
             }
-            try await loadVersions(bookmark)
-            error = nil
+            _ = try await loadVersions(bookmark)
         } catch { fail(error) }
     }
-    private func loadVersions(_ bookmark: Data) async throws {
-        let all = try await worker.versions(bookmark: bookmark, namespace: namespace)
+    private func loadVersions(_ bookmark: Data) async throws -> NativeBackupVersionScan {
+        localVersions = await worker.localVersions(directory)
+        let scan: NativeBackupVersionScan
+        #if DEBUG
+        if let readVersionsForTesting { scan = try await readVersionsForTesting() }
+        else { scan = try await worker.versions(bookmark: bookmark, namespace: namespace) }
+        #else
+        scan = try await worker.versions(bookmark: bookmark, namespace: namespace)
+        #endif
+        let all = scan.versions
         let account = store?.state["account"]["id"].text ?? ""
         versions = all.filter { account.isEmpty || ($0.manifest.accountID ?? "") == account }
         lastBackup = versions.first(where: \.uploaded)?.manifest.createdAt
         uploading = versions.contains(where: waitingForUpload)
         // Never expire recovery points until the latest package is safely in iCloud.
-        if all.first?.uploaded == true {
+        if store?.hasLoadedState == true && scan.complete && all.first?.uploaded == true {
             let removed = try await worker.prune(bookmark: bookmark, namespace: namespace, versions: all)
             versions.removeAll { removed.contains($0.id) }
         }
-        localVersions = await worker.localVersions(directory)
         #if DEBUG
         if namespace == "Gearhouse QA Backups" {
             let evidence: Value = ["at":.string(NativeDate.now), "enabled":.bool(enabled), "versions":.array(versions.map {
@@ -327,14 +639,15 @@ final class NativeCloudBackup: ObservableObject {
             try? evidence.jsonData().write(to: directory.appendingPathComponent("cloud-backup-verification.json"), options: .atomic)
         }
         #endif
+        error = scan.readMessage
+        return scan
     }
     func reload() async {
         guard !working else { return }
         working = true; phase = "正在读取备份…"; defer { working = false; phase = "" }
         do {
-            if let bookmark = settings.bookmark { try await loadVersions(bookmark) }
-            else { localVersions = await worker.localVersions(directory) }
-            error = nil
+            if let bookmark = settings.bookmark { _ = try await loadVersions(bookmark) }
+            else { localVersions = await worker.localVersions(directory); error = nil }
         } catch { fail(error) }
     }
     func restore(_ version: NativeBackupVersion) async -> Bool {
@@ -346,9 +659,11 @@ final class NativeCloudBackup: ObservableObject {
         do {
             let prepared = try await worker.prepare(version, bookmark: settings.bookmark, namespace: namespace, work: directory.appendingPathComponent("BackupWork"))
             package = prepared.url
+            let hadLoadedState = store.hasLoadedState
             let current = try store.beginBackupRestore(); locked = true
             guard current["account"].isNull || current["account"]["id"].text == prepared.state["account"]["id"].text else { throw DomainError("备份属于其他 ICU 账户") }
-            _ = try await worker.safety(state: current, directory: directory)
+            if hadLoadedState { _ = try await worker.safety(state: current, directory: directory) }
+            else { try store.preserveLocalSource() }
             added = try await worker.installMedia(from: prepared.url, state: prepared.state, into: directory)
             try store.applyRestoredBackup(prepared.state)
             await worker.remove([prepared.url]); package = nil; added = []
@@ -363,11 +678,6 @@ final class NativeCloudBackup: ObservableObject {
     }
     private func fail(_ failure: Error) {
         NSLog("Gearhouse backup failed: %@", failure.localizedDescription)
-        let ns = failure as NSError
-        if ns.domain == NSCocoaErrorDomain && ns.code == NSUbiquitousFileNotUploadedDueToQuotaError {
-            error = "iCloud 空间不足，请清理空间后重试。"
-        } else if ns.domain == NSCocoaErrorDomain && ns.code == NSUbiquitousFileUbiquityServerNotAvailable {
-            error = "暂时无法连接 iCloud，请稍后重试。"
-        } else { error = (failure as? NativeBackupError)?.errorDescription ?? failure.userFacingMessage }
+        error = NativeBackupUploadFailure(failure)?.message ?? (failure as? NativeBackupError)?.errorDescription ?? failure.userFacingMessage
     }
 }

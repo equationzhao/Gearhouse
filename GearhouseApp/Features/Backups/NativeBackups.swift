@@ -19,6 +19,10 @@ struct NativeBackupSettings: View {
 }
 
 private struct NativeBackupSettingsContent: View {
+    private enum FileOperation: Equatable {
+        case preparingExport, readingImport
+        var title: String { self == .preparingExport ? "正在准备导出" : "正在读取备份" }
+    }
     @EnvironmentObject private var store: NativeStore
     @ObservedObject var manager: NativeCloudBackup
     var previewImportConfirmation = false
@@ -29,38 +33,87 @@ private struct NativeBackupSettingsContent: View {
     @State private var pendingPackage: NativeBackupVersion?
     @State private var pendingImport: Data?
     @State private var failure: String?
+    @State private var fileOperation: FileOperation?
+    @State private var fileOperationID: UUID?
+    @State private var fileTask: Task<Void, Never>?
+    @State private var stoppingFileOperation = false
+    #if DEBUG
+    @State private var previewHeldExport = false
+    #endif
+    private var fileControlsDisabled: Bool { manager.working || fileOperation != nil }
+    private var importBlocked: Bool { manager.working || store.busy || store.refreshingGears || store.backupRestoring }
     var body: some View {
         Form {
-            Section {
+            Section("自动备份") {
                 Toggle("iCloud Drive 自动备份", isOn: Binding(get: { manager.enabled }, set: { enabled in
-                    if enabled && !manager.hasLocation { locationPicker = true }
+                    if enabled && !manager.hasLocation { failure = nil; locationPicker = true }
                     else { manager.setEnabled(enabled) }
-                })).disabled(manager.working).accessibilityIdentifier("backup-enabled")
+                })).disabled(manager.working || !store.hasLoadedState).accessibilityIdentifier("backup-enabled")
                 if manager.working {
                     HStack { ProgressView(); Text(manager.phase) }
                 } else if manager.uploading {
                     Label("等待 iCloud 上传", systemImage: "icloud.and.arrow.up")
                 } else if let date = manager.lastBackup {
                     LabeledContent("最近备份") { Text(date, format: .dateTime.year().month().day().hour().minute()) }
-                } else { Text("尚无备份").foregroundStyle(.secondary) }
-                NavigationLink("恢复备份") { NativeBackupVersions(manager: manager) }
+                } else { Text("尚无备份").foregroundStyle(NativeAppearance.secondaryText) }
+                Button { Task { await manager.tick(force: true) } } label: {
+                    Label("立即备份", systemImage: "icloud.and.arrow.up")
+                        .foregroundStyle(store.hasLoadedState && manager.enabled && !manager.working && !store.busy ? NativeAppearance.accent : NativeAppearance.secondaryText)
+                }.disabled(!store.hasLoadedState || !manager.enabled || manager.working || store.busy).accessibilityIdentifier("backup-now")
+                Button { failure = nil; locationPicker = true } label: { Label("选择备份文件夹", systemImage: "folder") }
+                    .disabled(manager.working).accessibilityIdentifier("backup-location")
+            }
+            Section {
+                NavigationLink { NativeBackupVersions(manager: manager) } label: { Label("恢复备份", systemImage: "clock.arrow.circlepath") }
                     .accessibilityIdentifier("backup-versions").disabled(manager.working)
             }
-            if let error = manager.error ?? failure { Section { Text(error).foregroundStyle(.red) } }
+            Section("备份文件") {
+                Button(action: prepareFileExport) {
+                    Label("导出备份", systemImage: "square.and.arrow.up")
+                        .foregroundStyle(!store.hasLoadedState || fileControlsDisabled ? NativeAppearance.secondaryText : NativeAppearance.accent)
+                }.disabled(!store.hasLoadedState || fileControlsDisabled).accessibilityIdentifier("backup-export")
+                Button { failure = nil; importing = true } label: { Label("导入备份", systemImage: "square.and.arrow.down") }
+                    .disabled(store.busy || store.refreshingGears || fileControlsDisabled).accessibilityIdentifier("backup-import")
+                if let fileOperation {
+                    HStack(spacing: 12) {
+                        ProgressView()
+                        Text(stoppingFileOperation ? "正在停止…" : fileOperation.title)
+                            .foregroundStyle(NativeAppearance.secondaryText)
+                    }.accessibilityElement(children: .combine).accessibilityIdentifier("backup-file-progress")
+                    Button("取消", action: cancelFileOperation)
+                        .disabled(stoppingFileOperation).accessibilityIdentifier("backup-file-cancel")
+                }
+            }
+            if let failure {
+                Section { Text(failure).foregroundStyle(NativeAppearance.dangerText).accessibilityIdentifier("backup-file-error") }
+            }
+            if let error = manager.error {
+                Section { Text(error).foregroundStyle(NativeAppearance.dangerText).accessibilityIdentifier("backup-cloud-error") }
+            }
         }
+        .scrollContentBackground(.hidden).background(NativeAppearance.canvas)
         .navigationTitle("备份与恢复").navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            Menu {
-                Button("立即备份", systemImage: "icloud.and.arrow.up") { Task { await manager.tick(force: true) } }
-                    .disabled(!manager.enabled || manager.working).accessibilityIdentifier("backup-now")
-                Button("选择备份文件夹", systemImage: "folder") { locationPicker = true }.disabled(manager.working)
-                Divider()
-                Button("导出备份") {
-                    do { document = NativeBackupDocument(data: try store.exportBackup()); exporting = true }
-                    catch { failure = error.userFacingMessage }
-                }.disabled(manager.working)
-                Button("导入备份") { importing = true }.disabled(store.busy || manager.working)
-            } label: { Image(systemName: "ellipsis") }.accessibilityLabel("更多备份操作")
+        .alert("使用备份替换本机数据？", isPresented: Binding(get: { pendingImport != nil }, set: { if !$0 { pendingImport = nil } })) {
+            Button("导入并替换", role: .destructive) {
+                guard let data = pendingImport else { return }
+                guard !importBlocked else {
+                    failure = "请等待当前操作完成后，再重新选择备份文件。"; pendingImport = nil
+                    return
+                }
+                do { try store.importBackup(data); failure = nil } catch { failure = error.userFacingMessage }
+                pendingImport = nil
+            }.disabled(importBlocked)
+            Button("取消", role: .cancel) { pendingImport = nil }
+        } message: {
+            Text((store.hasLoadedState
+                  ? "当前本机数据将被替换，包括装备及类别、活动、记录、提醒、图片和附件。导入前会保留本机现有数据。"
+                  : "本机数据将被替换。导入前会保留当前无法读取的数据文件。")
+                 + (importBlocked ? "\n\n请等待当前操作完成后再导入。" : ""))
+        }
+        .onDisappear {
+            fileOperationID = nil
+            fileTask?.cancel(); fileTask = nil
+            fileOperation = nil; stoppingFileOperation = false
         }
         .task {
             await manager.reload()
@@ -70,33 +123,85 @@ private struct NativeBackupSettingsContent: View {
             #endif
         }
         .fileImporter(isPresented: $locationPicker, allowedContentTypes: [.folder]) { result in
-            do { let url = try result.get(); Task { await manager.select(url) } }
+            do { let url = try result.get(); failure = nil; Task { await manager.select(url) } }
             catch { if (error as NSError).code != NSUserCancelledError { failure = error.userFacingMessage } }
         }
         .fileExporter(isPresented: $exporting, document: document, contentType: .json, defaultFilename: "Gearhouse-" + NativeDate.today) { result in
-            if case .failure(let error) = result { failure = error.userFacingMessage }
+            document = nil
+            switch result {
+            case .success: failure = nil
+            case .failure(let error): if (error as NSError).code != NSUserCancelledError { failure = error.userFacingMessage }
+            }
         }
         .sheet(item: $pendingPackage) { NativeBackupRestore(manager: manager, version: $0) }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.json, UTType(exportedAs: "com.equationzhao.gearhouse.backup", conformingTo: .package)]) { result in
             do {
-                let url = try result.get(), access = url.startAccessingSecurityScopedResource()
-                defer { if access { url.stopAccessingSecurityScopedResource() } }
-                if url.pathExtension.lowercased() == GearBackupArchive.fileExtension {
-                    pendingPackage = NativeBackupVersion(manifest: try GearBackupArchive.manifest(at: url), url: url, uploaded: false, local: true)
-                } else {
-                    guard (try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) < 500 * 1024 * 1024 else { throw DomainError("备份过大") }
-                    pendingImport = try Data(contentsOf: url)
-                }
-            } catch { failure = error.userFacingMessage }
+                readImportSelection(try result.get())
+            } catch { if (error as NSError).code != NSUserCancelledError { failure = error.userFacingMessage } }
         }
-        .confirmationDialog("使用备份替换本机数据？", isPresented: Binding(get: { pendingImport != nil }, set: { if !$0 { pendingImport = nil } }), titleVisibility: .visible) {
-            Button("导入并替换", role: .destructive) {
-                guard let data = pendingImport else { return }
-                do { try store.importBackup(data); failure = nil } catch { failure = error.userFacingMessage }
-                pendingImport = nil
+    }
+    private func prepareFileExport() {
+        guard store.hasLoadedState, !fileControlsDisabled else { return }
+        let id = UUID(), state = store.state, generation = store.imageImportGeneration
+        let media = store.directory.appendingPathComponent("media")
+        fileOperationID = id; fileOperation = .preparingExport; stoppingFileOperation = false
+        failure = nil; document = nil
+        #if DEBUG
+        let hold = store.directory.lastPathComponent == "GearhousePreview"
+            && ProcessInfo.processInfo.arguments.contains("-preview-route")
+            && ProcessInfo.processInfo.arguments.contains("-hold-backup-export") && !previewHeldExport
+        if hold { previewHeldExport = true }
+        #endif
+        fileTask = Task {
+            defer { finishFileOperation(id) }
+            do {
+                let data: Data
+                #if DEBUG
+                if hold {
+                    data = try await NativeBackupFiles.prepareExport(state: state, media: media, beforeRead: { _ in
+                        try await Task.sleep(for: .seconds(60))
+                    })
+                } else { data = try await NativeBackupFiles.prepareExport(state: state, media: media) }
+                #else
+                data = try await NativeBackupFiles.prepareExport(state: state, media: media)
+                #endif
+                try Task.checkCancellation()
+                guard fileOperationID == id else { return }
+                guard generation == store.imageImportGeneration else { throw DomainError("本机数据已恢复，请重新导出备份。") }
+                document = NativeBackupDocument(data: data); exporting = true
+            } catch {
+                if !Task.isCancelled && !(error is CancellationError) && fileOperationID == id { failure = error.userFacingMessage }
             }
-            Button("取消", role: .cancel) { pendingImport = nil }
-        } message: { Text("当前装备、活动、记录、图片和附件将被替换。导入前会保留一份本机备份。") }
+        }
+    }
+    private func readImportSelection(_ url: URL) {
+        guard fileOperation == nil else { return }
+        let id = UUID()
+        fileOperationID = id; fileOperation = .readingImport; stoppingFileOperation = false
+        failure = nil; pendingImport = nil; pendingPackage = nil
+        fileTask = Task {
+            defer { finishFileOperation(id) }
+            do {
+                let selection = try await NativeBackupFiles.readSelection(from: url)
+                try Task.checkCancellation()
+                guard fileOperationID == id else { return }
+                switch selection {
+                case .json(let data): pendingImport = data
+                case .package(let version): pendingPackage = version
+                }
+            } catch {
+                if !Task.isCancelled && !(error is CancellationError) && fileOperationID == id { failure = error.userFacingMessage }
+            }
+        }
+    }
+    private func cancelFileOperation() {
+        guard fileOperation != nil else { return }
+        stoppingFileOperation = true
+        fileTask?.cancel()
+    }
+    private func finishFileOperation(_ id: UUID) {
+        guard fileOperationID == id else { return }
+        fileOperationID = nil; fileTask = nil; fileOperation = nil; stoppingFileOperation = false
     }
     #if DEBUG
     private func seedBackupPhoto() {
@@ -124,21 +229,43 @@ struct NativeBackupVersions: View {
             if !manager.localVersions.isEmpty {
                 Section("恢复前备份 · 本机") { ForEach(manager.localVersions) { version in versionRow(version) } }
             }
-            if !manager.working && manager.versions.isEmpty && manager.localVersions.isEmpty { Text("暂无备份").foregroundStyle(.secondary) }
-            if let error = manager.error { Section { Text(error).foregroundStyle(.red) } }
+            if !manager.working && manager.versions.isEmpty && manager.localVersions.isEmpty {
+                if let error = manager.error {
+                    ContentUnavailableView {
+                        Label("无法读取备份", systemImage: "exclamationmark.icloud")
+                    } description: {
+                        Text(error).foregroundStyle(NativeAppearance.secondaryText)
+                    } actions: {
+                        renderRetryButton()
+                    }.listRowBackground(Color.clear)
+                } else {
+                    ContentUnavailableView("暂无备份", systemImage: "clock.arrow.circlepath")
+                        .listRowBackground(Color.clear)
+                }
+            } else if !manager.working, let error = manager.error {
+                Section {
+                    Text(error).foregroundStyle(NativeAppearance.dangerText)
+                    renderRetryButton()
+                }
+            }
         }
+        .scrollContentBackground(.hidden).background(NativeAppearance.canvas)
         .navigationTitle("恢复备份").navigationBarTitleDisplayMode(.inline)
         .task { await manager.reload() }
         .refreshable { await manager.reload() }
         .sheet(item: $selected) { NativeBackupRestore(manager: manager, version: $0) }
+    }
+    private func renderRetryButton() -> some View {
+        Button("重新读取备份") { Task { await manager.reload() } }
+            .accessibilityIdentifier("backup-reload")
     }
     private func versionRow(_ version: NativeBackupVersion) -> some View {
         Button { selected = version } label: {
             HStack {
                 Text(version.manifest.createdAt, format: .dateTime.year().month().day().hour().minute().second())
                 Spacer()
-                if manager.waitingForUpload(version) { Image(systemName: "icloud.and.arrow.up").foregroundStyle(.secondary).accessibilityLabel("等待上传") }
-                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                if manager.waitingForUpload(version) { Image(systemName: "icloud.and.arrow.up").foregroundStyle(NativeAppearance.secondaryText).accessibilityLabel("等待上传") }
+                Image(systemName: "chevron.right").font(.caption).foregroundStyle(NativeAppearance.secondaryText)
             }
         }.tint(.primary).accessibilityIdentifier("backup-version-" + version.id).disabled(manager.working)
     }
@@ -146,6 +273,7 @@ struct NativeBackupVersions: View {
 
 private struct NativeBackupRestore: View {
     @ObservedObject var manager: NativeCloudBackup
+    @EnvironmentObject private var store: NativeStore
     @Environment(\.dismiss) private var dismiss
     let version: NativeBackupVersion
     @State private var confirming = false
@@ -164,15 +292,20 @@ private struct NativeBackupRestore: View {
                     if manager.working { HStack { ProgressView(); Text(manager.phase) } }
                     else { Button("恢复这份备份", role: .destructive) { confirming = true }.accessibilityIdentifier("backup-restore") }
                 }
-                if let error = manager.error { Section { Text(error).foregroundStyle(.red) } }
+                if let error = manager.error { Section { Text(error).foregroundStyle(NativeAppearance.dangerText) } }
             }
+            .labeledContentStyle(NativeReadableValueStyle())
             .navigationTitle("备份详情").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() }.disabled(manager.working) } }
             .interactiveDismissDisabled(manager.working)
-            .confirmationDialog("恢复这份备份？", isPresented: $confirming, titleVisibility: .visible) {
+            .alert("恢复这份备份？", isPresented: $confirming) {
                 Button("恢复并替换", role: .destructive) { Task { if await manager.restore(version) { dismiss() } } }.accessibilityIdentifier("backup-restore-confirm")
                 Button("取消", role: .cancel) {}
-            } message: { Text("当前装备、活动、记录、图片和附件将被替换。恢复前会保留一份本机备份。") }
+            } message: {
+                Text(store.hasLoadedState
+                     ? "当前本机数据将被替换，包括装备及类别、活动、记录、提醒、图片和附件。恢复前会保留本机现有数据。"
+                     : "本机数据将被替换。恢复前会保留当前无法读取的数据文件。")
+            }
         }
     }
 }
